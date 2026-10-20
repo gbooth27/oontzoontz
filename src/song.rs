@@ -240,16 +240,16 @@ impl Preset {
             Preset::Choir => "\"aah\" voices",
             Preset::Organ => "house-music organ",
             Preset::Bell => "glassy music box",
-            Preset::DustyKeys => "warbly old record, Avalanches-ish",
-            Preset::Talkbox => "robot voice, Daft Punk-ish",
+            Preset::DustyKeys => "warbly old-record keys",
+            Preset::Talkbox => "robot voice",
             Preset::Disco => "filtered French house chords",
-            Preset::Bass => "squelchy 303, LCD Soundsystem-ish",
+            Preset::Bass => "squelchy 303 acid",
             Preset::Sub => "deep and round",
             Preset::Eight08 => "booming hip-hop / trap bass",
-            Preset::Squelch => "funky gliding synth, Da Funk-ish",
+            Preset::Squelch => "funky gliding synth",
             Preset::Reese => "dark, wide drum & bass",
             Preset::Wobble => "wub wub dubstep",
-            Preset::Growl => "angry talking bass, Skrillex-ish",
+            Preset::Growl => "angry talking dubstep bass",
         }
     }
 
