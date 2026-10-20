@@ -9,7 +9,9 @@ use crate::song::{Clip, Song};
 const EXPORT_RATE: u32 = 44_100;
 /// Let echoes and long notes ring out after the last loop.
 const TAIL_SECONDS: f32 = 2.5;
-const MAX_IMPORT_SECONDS: f32 = 10.0;
+/// Longest sound we keep from a file: drums are short, chops can be longer.
+pub const DRUM_SECONDS: f32 = 10.0;
+pub const SAMPLE_SECONDS: f32 = 60.0;
 
 /// What to put in the WAV.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -69,12 +71,12 @@ pub fn export_wav(song: &Song, what: Export, path: &Path) -> Result<(), String> 
     writer.finalize().map_err(|e| e.to_string())
 }
 
-/// Read any common WAV as mono. Long files are cut to ten seconds.
-pub fn load_wav(path: &Path) -> Result<Clip, String> {
+/// Read any common WAV as mono, keeping at most `max_seconds` of it.
+pub fn load_wav(path: &Path, max_seconds: f32) -> Result<Clip, String> {
     let mut reader = hound::WavReader::open(path).map_err(|e| e.to_string())?;
     let spec = reader.spec();
     let channels = spec.channels.max(1) as usize;
-    let max = (spec.sample_rate as f32 * MAX_IMPORT_SECONDS) as usize * channels;
+    let max = (spec.sample_rate as f32 * max_seconds) as usize * channels;
     let samples: Vec<f32> = match spec.sample_format {
         hound::SampleFormat::Float => reader
             .samples::<f32>()
@@ -119,10 +121,10 @@ mod tests {
         let path = temp_wav("scene.wav");
         let song = Song::starter();
         export_wav(&song, Export::Scene { scene: 0, loops: 2 }, &path).unwrap();
-        let clip = load_wav(&path).unwrap();
+        let clip = load_wav(&path, DRUM_SECONDS).unwrap();
         assert_eq!(clip.rate, EXPORT_RATE);
         let seconds = clip.data.len() as f32 / EXPORT_RATE as f32;
-        let expected = (song.scene_seconds(0) * 2.0 + TAIL_SECONDS).min(MAX_IMPORT_SECONDS);
+        let expected = (song.scene_seconds(0) * 2.0 + TAIL_SECONDS).min(DRUM_SECONDS);
         assert!((seconds - expected).abs() < 0.01, "{seconds} vs {expected}");
         assert!(clip.data.iter().any(|s| s.abs() > 0.1));
         std::fs::remove_file(&path).unwrap();

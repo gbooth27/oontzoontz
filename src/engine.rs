@@ -14,7 +14,8 @@ use crossbeam_channel::{Receiver, Sender};
 use crate::drums::all_kits;
 use crate::dsp::{Rng, Svf, pan};
 use crate::song::{
-    DRUMS, HAT, MAX_ROWS, OPEN_HAT, SCENES, STEPS_PER_BAR, SYNTHS, Song, VOICE_LANES, note_covering,
+    DRUMS, HAT, MAX_ROWS, MAX_SLICES, OPEN_HAT, SCENES, STEPS_PER_BAR, SYNTHS, Song, VOICE_LANES,
+    note_covering,
 };
 use crate::synth::{Synth, patch};
 
@@ -28,6 +29,12 @@ const ECHO_MAX_SECONDS: f32 = 3.0;
 const PUMP_DEPTH: f32 = 0.8;
 /// Most mic latency we will trust before deciding the number is junk.
 const MAX_LATENCY: f32 = 0.25;
+/// Stretching a take: how long each grain is, and how far a grain may slide
+/// to line its wave up with the one before.
+const GRAIN_SECONDS: f32 = 0.04;
+const GRAIN_SLIDE_SECONDS: f32 = 0.01;
+/// How quickly a synth's level follows a new scene's mix, so it doesn't click.
+const LEVEL_SECONDS: f32 = 0.01;
 
 /// "Nothing" for the atomics that hold an optional index.
 pub const NONE: usize = usize::MAX;
@@ -112,6 +119,10 @@ pub enum Cmd {
         track: usize,
         row: usize,
     },
+    PreviewSlice {
+        scene: usize,
+        slice: usize,
+    },
     Mic(rtrb::Consumer<f32>),
     /// Count in one bar, then record exactly one loop of `scene` from the mic
     /// into `buf`. `buf` must already have room for the whole take (see [`take_capacity`]).
@@ -151,23 +162,27 @@ pub fn take_capacity(loop_secs: f32, rate: f32) -> usize {
 /// One playback of a sample. Two per sound so a retrigger can fade the old one out.
 #[derive(Clone, Copy, Debug, Default)]
 struct Player {
+    /// Where we are in the sound. For a stretched take: frames since it started.
     pos: f64,
     on: bool,
     fading: bool,
     gain: f32,
-    /// The scene whose sound (kit or take) this is playing.
+    /// The scene whose sound (kit, take or chop) this is playing.
     scene: usize,
+    /// Which chop slice.
+    slice: usize,
+    /// Stretched takes: where the newest grain and the one before it start in the take.
+    grains: [f64; 2],
 }
 
 fn retrigger(slots: &mut [Player; 2], scene: usize) {
     slots[1] = slots[0];
     slots[1].fading = true;
     slots[0] = Player {
-        pos: 0.0,
         on: true,
-        fading: false,
         gain: 1.0,
         scene,
+        ..Player::default()
     };
 }
 
@@ -194,6 +209,121 @@ fn play_one(p: &mut Player, data: &[f32], ratio: f64, fade_step: f32) -> f32 {
         }
     }
     s * p.gain
+}
+
+/// One chop slice. `data` is just the slice; its edges get a quick fade so
+/// cutting into the middle of a sound doesn't click.
+fn play_slice(p: &mut Player, data: &[f32], ratio: f64, fade_step: f32) -> f32 {
+    let into = (p.pos / ratio) as f32;
+    let left = ((data.len() as f64 - p.pos) / ratio) as f32;
+    let edge = (into * fade_step * 4.0)
+        .min(left * fade_step)
+        .clamp(0.0, 1.0);
+    play_one(p, data, ratio, fade_step) * edge
+}
+
+fn sample_at(data: &[f32], pos: f64) -> f32 {
+    if pos < 0.0 {
+        return 0.0;
+    }
+    let i = pos as usize;
+    if i + 1 >= data.len() {
+        return 0.0;
+    }
+    let frac = (pos - i as f64) as f32;
+    data[i] + (data[i + 1] - data[i]) * frac
+}
+
+/// Play a take `speed` times faster (or slower) without changing its pitch.
+///
+/// This is WSOLA: the take is played as overlapping grains, each faded in as
+/// the last fades out. Grains start where the new tempo says they should, but
+/// may slide a few milliseconds so their wave lines up with the grain before,
+/// which keeps a voice from sounding phasey. At `speed` 1 it plays the take
+/// back exactly. `ratio` is take samples per output frame (their rates may differ).
+fn play_stretched(
+    p: &mut Player,
+    data: &[f32],
+    ratio: f64,
+    speed: f64,
+    grain: usize,
+    slide: usize,
+    fade_step: f32,
+) -> f32 {
+    let hop = (grain / 2).max(1);
+    let hop_src = hop as f64 * ratio;
+    let t = p.pos as usize;
+    let age = t % hop;
+    if t == 0 {
+        // A make-believe grain before the first, reading exactly what the first reads.
+        p.grains = [0.0, -hop_src];
+    } else if age == 0 {
+        let natural = p.grains[0] + hop_src;
+        let target = t as f64 * speed * ratio;
+        let next = if (natural - target).abs() < 1.0 {
+            natural
+        } else {
+            // Slowed down, the last grains would run off the end; repeat the
+            // end instead so the take fills the whole loop.
+            let last_start = (data.len() as f64 - 2.0 * hop_src).max(0.0);
+            best_match(data, natural, target, slide, hop_src as usize).min(last_start)
+        };
+        p.grains = [next, p.grains[0]];
+    }
+    if p.pos * speed * ratio > data.len() as f64 + grain as f64 * ratio {
+        p.on = false;
+        return 0.0;
+    }
+    let a = age as f64;
+    // sin² up and cos² down add up to exactly 1 at every point.
+    let w = (std::f64::consts::FRAC_PI_2 * a / hop as f64).sin().powi(2) as f32;
+    let new = sample_at(data, p.grains[0] + a * ratio);
+    let old = sample_at(data, p.grains[1] + (a + hop as f64) * ratio);
+    p.pos += 1.0;
+    if p.fading {
+        p.gain -= fade_step;
+        if p.gain <= 0.0 {
+            p.on = false;
+            return 0.0;
+        }
+    }
+    (new * w + old * (1.0 - w)) * p.gain
+}
+
+/// Where near `target` the take sounds most like it does at `natural`, so
+/// the next grain can pick up in step with the last one. Never allocates.
+fn best_match(data: &[f32], natural: f64, target: f64, slide: usize, len: usize) -> f64 {
+    let len = len.max(8);
+    let n = natural.round();
+    if n < 0.0 || n as usize + len > data.len() {
+        return target.max(0.0);
+    }
+    let n = n as usize;
+    let last = data.len() - len;
+    let lo = (target as usize).saturating_sub(slide).min(last);
+    let hi = (target as usize + slide).min(last);
+    let score = |c: usize, step: usize| {
+        let (mut dot, mut energy) = (0.0f32, 1e-9f32);
+        for i in (0..len).step_by(step) {
+            let x = data[c + i];
+            dot += x * data[n + i];
+            energy += x * x;
+        }
+        dot / energy.sqrt()
+    };
+    // On a tie (say, silence), stay close to where the tempo says to be.
+    let nudge = 1e-3 / slide.max(1) as f32;
+    let best = |range: std::ops::RangeInclusive<usize>, every: usize, step: usize| {
+        range
+            .step_by(every)
+            .map(|c| (c, score(c, step) - nudge * (c as f64 - target).abs() as f32))
+            .max_by(|a, b| a.1.total_cmp(&b.1))
+            .map(|(c, _)| c)
+    };
+    // Rough look every 4 samples, then a close look around the best one.
+    let rough = best(lo..=hi, 4, 4).unwrap_or(lo);
+    let close = best(rough.saturating_sub(3).max(lo)..=(rough + 3).min(hi), 1, 2);
+    close.unwrap_or(rough) as f64
 }
 
 /// The sample a drum plays in a scene: the user's WAV, or that scene's kit.
@@ -382,7 +512,10 @@ pub struct Engine {
     drums: [[Player; 2]; DRUMS],
     drum_pan: [(f32, f32); DRUMS],
     synths: [Synth; SYNTHS],
+    /// Each synth's volume, gliding toward what the current scene wants.
+    synth_level: [f32; SYNTHS],
     voices: [[Player; 2]; VOICE_LANES],
+    chop: [Player; 2],
     click: Click,
     echo: Echo,
     dust: Dust,
@@ -420,7 +553,9 @@ impl Engine {
             drums: [[Player::default(); 2]; DRUMS],
             drum_pan: DRUM_PAN.map(pan),
             synths: Default::default(),
+            synth_level: [0.0; SYNTHS],
             voices: [[Player::default(); 2]; VOICE_LANES],
+            chop: [Player::default(); 2],
             click: Click::default(),
             echo: Echo::new((sr * ECHO_MAX_SECONDS) as usize),
             dust: Dust {
@@ -536,6 +671,7 @@ impl Engine {
         for v in &mut self.voices {
             fade_out(v);
         }
+        fade_out(&mut self.chop);
     }
 
     fn take_rec_buf(&mut self) -> Option<Vec<f32>> {
@@ -596,7 +732,10 @@ impl Engine {
                 let p = patch(self.song.scenes[scene].sounds[track].preset);
                 self.synths[track].note_on(freq, gate, &p);
             }
-            Cmd::PreviewDrum { .. } | Cmd::PreviewNote { .. } => {}
+            Cmd::PreviewSlice { scene, slice } if scene < SCENES && slice < MAX_SLICES => {
+                self.hit_slice(slice, scene);
+            }
+            Cmd::PreviewDrum { .. } | Cmd::PreviewNote { .. } | Cmd::PreviewSlice { .. } => {}
             Cmd::Mic(mic) => {
                 if let Some(old) = self.mic.replace(mic) {
                     self.trash(Trash::Mic(old));
@@ -692,6 +831,11 @@ impl Engine {
         }
     }
 
+    fn hit_slice(&mut self, slice: usize, scene: usize) {
+        retrigger(&mut self.chop, scene);
+        self.chop[0].slice = slice;
+    }
+
     fn trigger_step(&mut self, step: usize) {
         let base = self.base_step();
         let sr = self.sr;
@@ -700,21 +844,28 @@ impl Engine {
         let scene = &song.scenes[s];
         let steps = scene.steps();
         for drum in 0..DRUMS {
-            if scene.drums[drum][step] && !song.drums[drum].mute {
+            if scene.drums[drum][step] && !scene.drum_mix[drum].mute {
                 retrigger(&mut self.drums[drum], s);
                 if drum == HAT {
                     fade_out(&mut self.drums[OPEN_HAT]);
                 }
             }
         }
+        if !scene.chop.mute
+            && scene.chop.sample.is_some()
+            && let Some(slice) = scene.chop.hit_at(step)
+        {
+            retrigger(&mut self.chop, s);
+            self.chop[0].slice = slice;
+        }
         let rows = song.mood.rows();
         for t in 0..SYNTHS {
-            if song.synths[t].mute {
+            if scene.synth_mix[t].mute {
                 continue;
             }
             let p = patch(scene.sounds[t].preset);
             let notes = &scene.notes[t];
-            if song.synths[t].arp {
+            if scene.synth_mix[t].arp {
                 match arp_pick(notes, rows, step, self.arp[t]) {
                     Some(row) => {
                         self.arp[t] += 1;
@@ -851,55 +1002,86 @@ impl Engine {
         let beat = self.beat;
         let song = &*self.song;
         let scene = &song.scenes[self.scene];
+        let level_glide = 1.0 - (-1.0 / (LEVEL_SECONDS * sr)).exp();
         let (mut l, mut r, mut send) = (0.0f32, 0.0f32, 0.0f32);
 
+        // Drums, takes and chops that are still ringing from the last scene
+        // keep that scene's mix.
         for drum in 0..DRUMS {
-            let mut s = 0.0;
             for slot in self.drums[drum].iter_mut().filter(|p| p.on) {
                 let (data, ratio) = drum_sound(song, &self.kits, drum, slot.scene, sr);
-                s += play_one(slot, data, ratio, fade_step);
+                let v = song.scenes[slot.scene].drum_mix[drum].volume;
+                let s = play_one(slot, data, ratio, fade_step) * v * v;
+                l += s * self.drum_pan[drum].0;
+                r += s * self.drum_pan[drum].1;
             }
-            let g = song.drums[drum].volume * song.drums[drum].volume;
-            l += s * g * self.drum_pan[drum].0;
-            r += s * g * self.drum_pan[drum].1;
         }
 
         for (t, synth) in self.synths.iter_mut().enumerate() {
-            let track = &song.synths[t];
+            let mix = &scene.synth_mix[t];
             let p = patch(scene.sounds[t].preset);
             let lfo = if p.lfo_rate > 0.0 {
                 (0.5 - 0.5 * (TAU64 * beat * p.lfo_rate as f64).cos()) as f32
             } else {
                 0.0
             };
-            let (a, b) = synth.render(&p, track.bright, lfo, sr);
-            let g = track.volume * track.volume * if track.pump { pump } else { 1.0 };
+            let (a, b) = synth.render(&p, mix.bright, lfo, sr);
+            let level = &mut self.synth_level[t];
+            *level += (mix.volume * mix.volume - *level) * level_glide;
+            let g = *level * if mix.pump { pump } else { 1.0 };
             l += a * g;
             r += b * g;
-            if track.echo {
+            if mix.echo {
                 send += (a + b) * 0.25 * g;
             }
         }
 
+        let grain = (GRAIN_SECONDS * sr) as usize;
         for lane in 0..VOICE_LANES {
-            let mut s = 0.0;
-            for slot in self.voices[lane].iter_mut().filter(|p| p.on) {
-                match &song.scenes[slot.scene].takes[lane] {
-                    Some(take) => {
-                        let ratio = take.clip.rate as f64 / sr as f64;
-                        s += play_one(slot, &take.clip.data, ratio, fade_step);
-                    }
-                    None => slot.on = false,
+            if rec_lane == Some(lane) {
+                // Don't play the old take back while the new one is going down.
+                for slot in &mut self.voices[lane] {
+                    slot.on = false;
                 }
-            }
-            let v = &song.voices[lane];
-            if v.mute || rec_lane == Some(lane) {
                 continue;
             }
-            let g = v.volume * v.volume;
+            for slot in self.voices[lane].iter_mut().filter(|p| p.on) {
+                let scene = &song.scenes[slot.scene];
+                let Some(take) = &scene.takes[lane] else {
+                    slot.on = false;
+                    continue;
+                };
+                let ratio = take.clip.rate as f64 / sr as f64;
+                let speed = (song.bpm / take.bpm.max(1.0)) as f64;
+                let slide = (GRAIN_SLIDE_SECONDS * take.clip.rate as f32) as usize;
+                let data = &take.clip.data;
+                let s = play_stretched(slot, data, ratio, speed, grain, slide, fade_step);
+                let v = &scene.voice_mix[lane];
+                if v.mute {
+                    continue;
+                }
+                let s = s * v.volume * v.volume;
+                l += s;
+                r += s;
+                if v.echo {
+                    send += s * 0.5;
+                }
+            }
+        }
+
+        for slot in self.chop.iter_mut().filter(|p| p.on) {
+            let chop = &song.scenes[slot.scene].chop;
+            let Some(sample) = chop.sample.and_then(|i| song.samples.get(i)) else {
+                slot.on = false;
+                continue;
+            };
+            let (a, b) = chop.slice_range(slot.slice, &sample.clip);
+            let ratio = sample.clip.rate as f64 / sr as f64 * 2f64.powf(chop.pitch as f64 / 12.0);
+            let s = play_slice(slot, &sample.clip.data[a..b], ratio, fade_step);
+            let g = chop.volume * chop.volume * if chop.pump { pump } else { 1.0 };
             l += s * g;
             r += s * g;
-            if v.echo {
+            if chop.echo {
                 send += s * g * 0.5;
             }
         }
@@ -915,7 +1097,7 @@ impl Engine {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::song::Preset;
+    use crate::song::{Clip, Preset};
     use crossbeam_channel::bounded;
 
     const SR: f32 = 48_000.0;
@@ -1131,6 +1313,159 @@ mod tests {
             .collect();
         assert_eq!(picks, vec![Some(0), Some(2), Some(4), Some(0)]);
         assert_eq!(arp_pick(&scene.notes[1], 11, 9, 0), None);
+    }
+
+    /// Zero crossings per second, and the quietest and loudest 10 ms stretch.
+    fn pitch_and_wobble(out: &[f32]) -> (f32, f32, f32) {
+        let crossings = out.windows(2).filter(|w| w[0] < 0.0 && w[1] >= 0.0).count();
+        let block = (SR * 0.01) as usize;
+        let levels: Vec<f32> = out
+            .chunks(block)
+            .filter(|c| c.len() == block)
+            .map(|c| c.iter().fold(0.0f32, |m, x| m.max(x.abs())))
+            .collect();
+        let lo = levels.iter().copied().fold(f32::MAX, f32::min);
+        let hi = levels.iter().copied().fold(0.0, f32::max);
+        (crossings as f32 / (out.len() as f32 / SR), lo, hi)
+    }
+
+    #[test]
+    fn stretched_takes_keep_their_pitch_and_fill_the_new_loop() {
+        // A 2 s, 220 Hz take recorded at 44.1 kHz, played on a 48 kHz card.
+        let rate = 44_100.0;
+        let take: Vec<f32> = (0..(2.0 * rate) as usize)
+            .map(|i| (TAU * 220.0 * i as f32 / rate).sin())
+            .collect();
+        let ratio = rate as f64 / SR as f64;
+        let grain = (GRAIN_SECONDS * SR) as usize;
+        let slide = (GRAIN_SLIDE_SECONDS * rate) as usize;
+        for speed in [1.0, 0.8, 1.25] {
+            let mut p = Player {
+                on: true,
+                gain: 1.0,
+                ..Player::default()
+            };
+            let mut out = Vec::new();
+            while p.on && out.len() < SR as usize * 5 {
+                out.push(play_stretched(
+                    &mut p, &take, ratio, speed, grain, slide, 0.01,
+                ));
+            }
+            let expect = 2.0 / speed as f32 * SR;
+            assert!(
+                (out.len() as f32 - expect).abs() < grain as f32 * 2.0,
+                "speed {speed}: {} frames, want about {expect}",
+                out.len()
+            );
+            let body = &out[grain..out.len() - grain * 3];
+            let (hz, lo, hi) = pitch_and_wobble(body);
+            assert!((hz - 220.0).abs() < 3.0, "speed {speed}: {hz} Hz");
+            assert!(
+                lo > 0.85 && hi < 1.1,
+                "speed {speed}: level wobbles {lo}..{hi}"
+            );
+        }
+        // Same speed is the take, sample for sample.
+        let mut p = Player {
+            on: true,
+            gain: 1.0,
+            ..Player::default()
+        };
+        for i in 0..2000 {
+            let s = play_stretched(&mut p, &take, 1.0, 1.0, grain, slide, 0.01);
+            assert!((s - take[i]).abs() < 1e-5);
+        }
+    }
+
+    #[test]
+    fn takes_follow_a_tempo_change() {
+        let mut song = Song {
+            bpm: 120.0,
+            ..Song::default()
+        };
+        let rate = 48_000;
+        let loop_frames = (song.scene_seconds(0) * SR) as usize;
+        let clip = Clip {
+            rate,
+            data: Arc::new(vec![0.5; loop_frames]),
+        };
+        song.scenes[0].takes[0] = Some(crate::song::Take {
+            clip,
+            bars: 1,
+            bpm: 120.0,
+        });
+        song.bpm = 100.0;
+        let mut engine = Engine::offline(SR, song.clone());
+        engine.set_loop_limit(Some(1));
+        engine.play_scene(0);
+        let out: Vec<f32> =
+            std::iter::from_fn(|| engine.is_playing().then(|| engine.frame().0)).collect();
+        // Slower tempo, longer loop, and the take still covers all of it.
+        assert!(out.len() > loop_frames * 11 / 10);
+        let tail = &out[out.len() - (SR * 0.1) as usize..];
+        assert!(
+            tail.iter().all(|s| s.abs() > 0.1),
+            "take ran out before the loop did"
+        );
+    }
+
+    #[test]
+    fn chop_plays_the_slice_on_each_step() {
+        let mut song = Song::default();
+        // A file whose sample values say which slice they belong to.
+        let rate = 48_000;
+        let data: Vec<f32> = (0..rate as usize)
+            .map(|i| 0.1 + (i * 4 / rate as usize) as f32 * 0.1)
+            .collect();
+        song.samples.push(crate::song::Sample {
+            name: "steps".into(),
+            clip: Clip {
+                rate,
+                data: Arc::new(data),
+            },
+        });
+        let chop = &mut song.scenes[0].chop;
+        chop.sample = Some(0);
+        chop.length = 1.0;
+        chop.slices = 4;
+        chop.set(2, 0, true);
+        chop.set(0, 4, true);
+        let mut engine = Engine::offline(SR, song.clone());
+        engine.play_scene(0);
+        let step = (song.step_seconds() * SR) as usize;
+        // Middle of step 0 plays slice 2, middle of step 4 plays slice 0.
+        let mut heard = Vec::new();
+        for i in 0..step * 5 {
+            let (l, _) = engine.frame();
+            if i == step / 2 || i == step * 4 + step / 2 {
+                heard.push(l);
+            }
+        }
+        assert_eq!(engine.chop[0].slice, 0);
+        assert!(heard[0] > heard[1] * 2.0, "{heard:?}");
+    }
+
+    #[test]
+    fn mutes_belong_to_one_scene() {
+        let mut song = Song::starter();
+        song.scenes[1] = song.scenes[0].clone();
+        for m in &mut song.scenes[1].drum_mix {
+            m.mute = true;
+        }
+        for m in &mut song.scenes[1].synth_mix {
+            m.mute = true;
+        }
+        song.arrangement = vec![0, 1];
+        let mut engine = Engine::offline(SR, song.clone());
+        engine.play_song();
+        let frames = (song.scene_seconds(0) * SR) as usize;
+        let loud = |e: &mut Engine, n| (0..n).fold(0.0f32, |m, _| m.max(e.frame().0.abs()));
+        let first = loud(&mut engine, frames);
+        // Skip the start of B so the 808 tail from A has rung out.
+        let skip = (SR * 1.2) as usize;
+        loud(&mut engine, skip);
+        let second = loud(&mut engine, frames - skip);
+        assert!(first > 0.2 && second < 0.03, "A {first}, B {second}");
     }
 
     #[test]

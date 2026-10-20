@@ -1,8 +1,9 @@
 //! The song: everything grug makes. Saved to disk as one JSON file.
 //!
-//! A song has tracks (the "mixer": how loud, muted, effects) and scenes (the
-//! sections: which squares are lit, which notes, which voice takes, and which
-//! sounds play them). The arrangement lists scenes in the order the song plays.
+//! A song is a set of scenes (the sections: which squares are lit, which notes,
+//! which voice takes, which sounds play them and how loud). The arrangement
+//! lists scenes in the order the song plays. Loaded sound files live on the
+//! song so scenes can share them.
 
 use std::path::Path;
 use std::sync::Arc;
@@ -19,7 +20,13 @@ pub const MAX_STEPS: usize = STEPS_PER_BAR * MAX_BARS;
 pub const MAX_ROWS: usize = 15;
 pub const DRUMS: usize = 8;
 pub const SYNTHS: usize = 3;
+pub const SYNTH_NAMES: [&str; SYNTHS] = ["Bass", "Lead", "Pad"];
 pub const VOICE_LANES: usize = 4;
+/// How many equal slices a chopped sample can be cut into.
+pub const SLICE_CHOICES: [usize; 3] = [4, 8, 16];
+pub const MAX_SLICES: usize = 16;
+/// Most sound files one song can hold for chopping.
+pub const MAX_SAMPLES: usize = 32;
 pub const SCENES: usize = 8;
 pub const SCENE_NAMES: [&str; SCENES] = ["A", "B", "C", "D", "E", "F", "G", "H"];
 /// Longest song row we allow, so a runaway click can't make an hour of music.
@@ -353,38 +360,53 @@ impl TryFrom<ClipFile> for Clip {
     }
 }
 
-/// A recorded voice take, and how many bars long its scene was at the time.
+/// A recorded voice take: how many bars long its scene was, and how fast the
+/// song was going, at the time. Played at another speed, it gets stretched to fit.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Take {
     pub clip: Clip,
     pub bars: usize,
+    /// 0 in files from before takes knew their tempo; sanitize fills it in.
+    #[serde(default)]
+    pub bpm: f32,
 }
 
+/// A sound file the user loaded for chopping. Lives on the song so any scene can use it.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Sample {
+    pub name: String,
+    pub clip: Clip,
+}
+
+/// A WAV the user loaded to replace a built-in drum, in every scene.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct DrumTrack {
-    pub volume: f32,
-    pub mute: bool,
-    /// A WAV the user loaded to replace the built-in sound.
     pub custom: Option<Clip>,
     pub custom_name: String,
 }
 
-impl Default for DrumTrack {
+/// How one drum sits in a scene's mix.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct DrumMix {
+    pub volume: f32,
+    pub mute: bool,
+}
+
+impl Default for DrumMix {
     fn default() -> Self {
-        DrumTrack {
+        DrumMix {
             volume: 0.8,
             mute: false,
-            custom: None,
-            custom_name: String::new(),
         }
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+/// How one synth track sounds and sits in a scene's mix.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
-pub struct SynthTrack {
-    pub name: String,
+pub struct SynthMix {
     /// 0.0 = dark, 1.0 = bright. Moves the filter.
     pub bright: f32,
     pub volume: f32,
@@ -396,10 +418,9 @@ pub struct SynthTrack {
     pub arp: bool,
 }
 
-impl Default for SynthTrack {
+impl Default for SynthMix {
     fn default() -> Self {
-        SynthTrack {
-            name: "Synth".into(),
+        SynthMix {
             bright: 0.5,
             volume: 0.7,
             mute: false,
@@ -410,17 +431,18 @@ impl Default for SynthTrack {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+/// How one voice lane sits in a scene's mix.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
-pub struct VoiceTrack {
+pub struct VoiceMix {
     pub volume: f32,
     pub mute: bool,
     pub echo: bool,
 }
 
-impl Default for VoiceTrack {
+impl Default for VoiceMix {
     fn default() -> Self {
-        VoiceTrack {
+        VoiceMix {
             volume: 0.8,
             mute: false,
             echo: false,
@@ -428,7 +450,110 @@ impl Default for VoiceTrack {
     }
 }
 
-/// One section of the song: a loop with its own beat, notes, voice takes and sounds.
+/// The chop track in one scene: part of a sound file cut into equal slices,
+/// played from a grid with one row per slice. Only one slice plays at a time.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Chop {
+    /// Index into [`Song::samples`].
+    pub sample: Option<usize>,
+    /// Where the chopped part starts in the file, in seconds.
+    pub start: f32,
+    /// How long the chopped part is, in seconds.
+    pub length: f32,
+    pub slices: usize,
+    /// Semitones up or down. Like speeding up a record, higher is also faster.
+    pub pitch: i32,
+    pub volume: f32,
+    pub mute: bool,
+    pub echo: bool,
+    pub pump: bool,
+    /// `hits[slice][step]`
+    pub hits: Vec<Vec<bool>>,
+}
+
+impl Default for Chop {
+    fn default() -> Self {
+        Chop {
+            sample: None,
+            start: 0.0,
+            length: 0.0,
+            slices: 8,
+            pitch: 0,
+            volume: 0.8,
+            mute: false,
+            echo: false,
+            pump: false,
+            hits: vec![vec![false; MAX_STEPS]; MAX_SLICES],
+        }
+    }
+}
+
+impl Chop {
+    /// Where slice `i` starts and ends, in samples of `clip`.
+    pub fn slice_range(&self, i: usize, clip: &Clip) -> (usize, usize) {
+        let rate = clip.rate as f32;
+        let len = clip.data.len();
+        let start = ((self.start * rate) as usize).min(len);
+        let end = (((self.start + self.length) * rate) as usize).clamp(start, len);
+        let n = self.slices.max(1);
+        let i = i.min(n - 1);
+        (
+            start + (end - start) * i / n,
+            start + (end - start) * (i + 1) / n,
+        )
+    }
+
+    /// The slice that plays on `step`, if any.
+    pub fn hit_at(&self, step: usize) -> Option<usize> {
+        (0..self.slices).find(|&i| self.hits[i][step])
+    }
+
+    pub fn has_hits(&self, steps: usize) -> bool {
+        self.hits.iter().any(|h| h[..steps].contains(&true))
+    }
+
+    pub fn clear(&mut self) {
+        for h in &mut self.hits {
+            h.fill(false);
+        }
+    }
+
+    /// Put `slice` on `step`, or take whatever is there away. One slice per step.
+    pub fn set(&mut self, slice: usize, step: usize, on: bool) {
+        if on {
+            for h in &mut self.hits {
+                h[step] = false;
+            }
+        }
+        self.hits[slice][step] = on;
+    }
+
+    /// Every slice once, in order, spread over the loop: plays the part as it was.
+    pub fn in_order(&mut self, steps: usize) {
+        self.clear();
+        let n = self.slices.max(1);
+        for i in 0..n {
+            self.hits[i][i * steps / n] = true;
+        }
+    }
+
+    /// Roll the dice: slices on most 8th notes, starting with the first slice.
+    pub fn shuffle(&mut self, steps: usize, rng: &mut Rng) {
+        self.clear();
+        let n = self.slices.max(1) as i32;
+        for s in (0..steps).step_by(2) {
+            if s == 0 {
+                self.hits[0][0] = true;
+            } else if rng.chance(0.7) {
+                self.hits[rng.range(0, n - 1) as usize][s] = true;
+            }
+        }
+    }
+}
+
+/// One section of the song: a loop with its own beat, notes, voice takes,
+/// sounds and mix.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Scene {
@@ -436,15 +561,23 @@ pub struct Scene {
     pub kit: Kit,
     /// `sounds[synth]`
     pub sounds: Vec<Sound>,
+    /// `drum_mix[drum]`
+    pub drum_mix: Vec<DrumMix>,
+    /// `synth_mix[synth]`
+    pub synth_mix: Vec<SynthMix>,
+    /// `voice_mix[lane]`
+    pub voice_mix: Vec<VoiceMix>,
     /// `drums[drum][step]`
     pub drums: Vec<Vec<bool>>,
     /// `notes[synth][row][step]` = note length in steps, 0 = no note starts here.
     pub notes: Vec<Vec<Vec<u8>>>,
     /// `takes[lane]`
     pub takes: Vec<Option<Take>>,
+    pub chop: Chop,
 }
 
 const DEFAULT_SOUNDS: [Preset; SYNTHS] = [Preset::Bass, Preset::Pluck, Preset::Pad];
+const DEFAULT_SYNTH_VOLUME: [f32; SYNTHS] = [0.7, 0.6, 0.5];
 
 impl Default for Scene {
     fn default() -> Self {
@@ -452,9 +585,18 @@ impl Default for Scene {
             bars: 1,
             kit: Kit::Boom,
             sounds: DEFAULT_SOUNDS.map(Sound::new).to_vec(),
+            drum_mix: vec![DrumMix::default(); DRUMS],
+            synth_mix: DEFAULT_SYNTH_VOLUME
+                .map(|volume| SynthMix {
+                    volume,
+                    ..SynthMix::default()
+                })
+                .to_vec(),
+            voice_mix: vec![VoiceMix::default(); VOICE_LANES],
             drums: vec![vec![false; MAX_STEPS]; DRUMS],
             notes: vec![vec![vec![0; MAX_STEPS]; MAX_ROWS]; SYNTHS],
             takes: vec![None; VOICE_LANES],
+            chop: Chop::default(),
         }
     }
 }
@@ -464,12 +606,13 @@ impl Scene {
         self.bars * STEPS_PER_BAR
     }
 
-    /// Nothing to hear: no hits, no notes, no takes.
+    /// Nothing to hear: no hits, no notes, no takes, no chops.
     pub fn is_empty(&self) -> bool {
         let steps = self.steps();
         self.drums.iter().all(|d| !d[..steps].contains(&true))
             && (0..SYNTHS).all(|t| !self.has_notes(t))
             && self.takes.iter().all(Option::is_none)
+            && !self.chop.has_hits(steps)
     }
 
     pub fn has_notes(&self, track: usize) -> bool {
@@ -479,10 +622,19 @@ impl Scene {
             .any(|r| r[..steps].iter().any(|&n| n > 0))
     }
 
-    /// Use another scene's kit and sounds (a new section starts with the same band).
+    /// Use another scene's kit, sounds, mix and chop setup, but not its
+    /// pattern (a new section starts with the same band).
     pub fn copy_sounds_from(&mut self, other: &Scene) {
         self.kit = other.kit;
         self.sounds.clone_from(&other.sounds);
+        self.drum_mix.clone_from(&other.drum_mix);
+        self.synth_mix.clone_from(&other.synth_mix);
+        self.voice_mix.clone_from(&other.voice_mix);
+        let hits = std::mem::take(&mut self.chop.hits);
+        self.chop = Chop {
+            hits,
+            ..other.chop.clone()
+        };
     }
 
     /// Change the loop length. Growing copies what is already there, so the
@@ -492,7 +644,7 @@ impl Scene {
         self.bars = bars.clamp(1, MAX_BARS);
         let new = self.steps();
         if new > old {
-            for d in &mut self.drums {
+            for d in self.drums.iter_mut().chain(&mut self.chop.hits) {
                 for s in old..new {
                     d[s] = d[s % old];
                 }
@@ -536,13 +688,14 @@ impl Scene {
         }
     }
 
-    /// Wipe the beat, notes and takes but keep the sounds and length.
+    /// Wipe the beat, notes, takes and chops but keep the sounds, mix and length.
     pub fn clear(&mut self) {
         self.clear_drums();
         for t in 0..SYNTHS {
             self.clear_notes(t);
         }
         self.takes.fill(None);
+        self.chop.clear();
     }
 
     /// Roll the dice for a beat that still sounds like a beat.
@@ -691,7 +844,8 @@ impl Scene {
         }
     }
 
-    fn sanitize(&mut self) {
+    /// `bpm` is the song's speed, `samples` how many sound files it holds.
+    fn sanitize(&mut self, bpm: f32, samples: usize) {
         self.bars = self.bars.clamp(1, MAX_BARS);
         let mut defaults = DEFAULT_SOUNDS.into_iter().skip(self.sounds.len());
         self.sounds.resize_with(SYNTHS, || {
@@ -712,9 +866,40 @@ impl Scene {
                 row.resize(MAX_STEPS, 0);
             }
         }
+        self.drum_mix.resize_with(DRUMS, DrumMix::default);
+        for d in &mut self.drum_mix {
+            d.volume = d.volume.clamp(0.0, 1.0);
+        }
+        self.synth_mix.resize_with(SYNTHS, SynthMix::default);
+        for t in &mut self.synth_mix {
+            t.bright = t.bright.clamp(0.0, 1.0);
+            t.volume = t.volume.clamp(0.0, 1.0);
+        }
+        self.voice_mix.resize_with(VOICE_LANES, VoiceMix::default);
+        for v in &mut self.voice_mix {
+            v.volume = v.volume.clamp(0.0, 1.0);
+        }
         self.takes.resize(VOICE_LANES, None);
         for take in self.takes.iter_mut().flatten() {
             take.bars = take.bars.clamp(1, MAX_BARS);
+            if !(40.0..=220.0).contains(&take.bpm) {
+                take.bpm = bpm;
+            }
+        }
+        let chop = &mut self.chop;
+        if chop.sample.is_none_or(|s| s >= samples) {
+            chop.sample = None;
+        }
+        if !SLICE_CHOICES.contains(&chop.slices) {
+            chop.slices = 8;
+        }
+        chop.pitch = chop.pitch.clamp(-12, 12);
+        chop.start = chop.start.max(0.0);
+        chop.length = chop.length.max(0.0);
+        chop.volume = chop.volume.clamp(0.0, 1.0);
+        chop.hits.resize_with(MAX_SLICES, || vec![false; MAX_STEPS]);
+        for h in &mut chop.hits {
+            h.resize(MAX_STEPS, false);
         }
     }
 }
@@ -741,9 +926,10 @@ pub struct Song {
     pub dust: f32,
     /// Metronome while playing.
     pub click: bool,
+    /// `drums[drum]`: sounds loaded over the built-in kits.
     pub drums: Vec<DrumTrack>,
-    pub synths: Vec<SynthTrack>,
-    pub voices: Vec<VoiceTrack>,
+    /// Sound files loaded for chopping.
+    pub samples: Vec<Sample>,
     pub scenes: Vec<Scene>,
     /// Scene numbers, in the order the song plays them.
     pub arrangement: Vec<usize>,
@@ -751,11 +937,6 @@ pub struct Song {
 
 impl Default for Song {
     fn default() -> Self {
-        let synth = |name: &str, volume| SynthTrack {
-            name: name.into(),
-            volume,
-            ..SynthTrack::default()
-        };
         Song {
             bpm: 110.0,
             swing: 0.0,
@@ -765,8 +946,7 @@ impl Default for Song {
             dust: 0.0,
             click: false,
             drums: vec![DrumTrack::default(); DRUMS],
-            synths: vec![synth("Bass", 0.7), synth("Lead", 0.6), synth("Pad", 0.5)],
-            voices: vec![VoiceTrack::default(); VOICE_LANES],
+            samples: Vec::new(),
             scenes: vec![Scene::default(); SCENES],
             arrangement: Vec::new(),
         }
@@ -830,36 +1010,105 @@ impl Song {
         self.volume = self.volume.clamp(0.0, 1.0);
         self.dust = self.dust.clamp(0.0, 1.0);
         self.drums.resize_with(DRUMS, DrumTrack::default);
-        for d in &mut self.drums {
-            d.volume = d.volume.clamp(0.0, 1.0);
-        }
-        self.synths.resize_with(SYNTHS, SynthTrack::default);
-        for t in &mut self.synths {
-            t.bright = t.bright.clamp(0.0, 1.0);
-            t.volume = t.volume.clamp(0.0, 1.0);
-        }
-        self.voices.resize_with(VOICE_LANES, VoiceTrack::default);
-        for v in &mut self.voices {
-            v.volume = v.volume.clamp(0.0, 1.0);
-        }
+        self.samples.truncate(MAX_SAMPLES);
         self.scenes.resize_with(SCENES, Scene::default);
         for scene in &mut self.scenes {
-            scene.sanitize();
+            scene.sanitize(self.bpm, self.samples.len());
         }
         self.arrangement.retain(|&s| s < SCENES);
         self.arrangement.truncate(MAX_ARRANGEMENT);
     }
 
+    /// Drop sound files no scene uses any more, so saved songs stay small.
+    pub fn prune_samples(&mut self) {
+        let used: Vec<bool> = (0..self.samples.len())
+            .map(|i| self.scenes.iter().any(|s| s.chop.sample == Some(i)))
+            .collect();
+        let mut new_index = vec![None; self.samples.len()];
+        let mut kept = 0;
+        for (i, &u) in used.iter().enumerate() {
+            if u {
+                new_index[i] = Some(kept);
+                kept += 1;
+            }
+        }
+        let mut i = 0;
+        self.samples.retain(|_| {
+            i += 1;
+            used[i - 1]
+        });
+        for scene in &mut self.scenes {
+            scene.chop.sample = scene.chop.sample.and_then(|s| new_index[s]);
+        }
+    }
+
     pub fn save(&self, path: &Path) -> Result<(), String> {
-        let json = serde_json::to_string(self).map_err(|e| e.to_string())?;
+        let mut song = self.clone();
+        song.prune_samples();
+        let json = serde_json::to_string(&song).map_err(|e| e.to_string())?;
         std::fs::write(path, json).map_err(|e| e.to_string())
     }
 
     pub fn load(path: &Path) -> Result<Song, String> {
         let text = std::fs::read_to_string(path).map_err(|e| e.to_string())?;
-        let mut song: Song = serde_json::from_str(&text).map_err(|e| e.to_string())?;
+        Song::from_json(&text)
+    }
+
+    pub fn from_json(text: &str) -> Result<Song, String> {
+        let mut json: serde_json::Value = serde_json::from_str(text).map_err(|e| e.to_string())?;
+        upgrade(&mut json);
+        let mut song: Song = serde_json::from_value(json).map_err(|e| e.to_string())?;
         song.sanitize();
         Ok(song)
+    }
+}
+
+/// Older files kept one mixer for the whole song. Give each scene a copy.
+fn upgrade(json: &mut serde_json::Value) {
+    use serde_json::Value;
+    let Some(song) = json.as_object_mut() else {
+        return;
+    };
+    let mut mixers = Vec::new();
+    for (old, new, keys) in [
+        ("drums", "drum_mix", &["volume", "mute"][..]),
+        (
+            "synths",
+            "synth_mix",
+            &["bright", "volume", "mute", "echo", "pump", "arp"],
+        ),
+        ("voices", "voice_mix", &["volume", "mute", "echo"]),
+    ] {
+        let Some(Value::Array(tracks)) = song.get(old) else {
+            continue;
+        };
+        // Only the mix settings; a drum's loaded sound stays on the song.
+        let mix: Vec<Value> = tracks
+            .iter()
+            .map(|t| {
+                let mut m = serde_json::Map::new();
+                for &k in keys {
+                    if let Some(v) = t.get(k) {
+                        m.insert(k.into(), v.clone());
+                    }
+                }
+                Value::Object(m)
+            })
+            .collect();
+        if mix
+            .iter()
+            .any(|m| m.as_object().is_some_and(|m| !m.is_empty()))
+        {
+            mixers.push((new, Value::Array(mix)));
+        }
+    }
+    let Some(Value::Array(scenes)) = song.get_mut("scenes") else {
+        return;
+    };
+    for scene in scenes.iter_mut().filter_map(Value::as_object_mut) {
+        for (key, mix) in &mixers {
+            scene.entry(*key).or_insert_with(|| mix.clone());
+        }
     }
 }
 
@@ -987,18 +1236,119 @@ mod tests {
                 data: Arc::new(vec![0.0, 0.5, -0.5, 0.25]),
             },
             bars: 2,
+            bpm: 95.0,
         });
+        song.scenes[2].synth_mix[1].pump = true;
+        song.scenes[2].drum_mix[3].mute = true;
         let json = serde_json::to_string(&song).unwrap();
-        let mut back: Song = serde_json::from_str(&json).unwrap();
-        back.sanitize();
+        let back = Song::from_json(&json).unwrap();
         let take = back.scenes[2].takes[1].as_ref().unwrap();
         assert_eq!(take.clip.rate, 22_050);
         assert_eq!(take.bars, 2);
+        assert_eq!(take.bpm, 95.0);
         assert!((take.clip.data[1] - 0.5).abs() < 1e-3);
         assert_eq!(back.scenes[0], song.scenes[0]);
         assert_eq!(back.scenes[2].sounds, song.scenes[2].sounds);
-        assert_eq!(back.synths, song.synths);
+        assert_eq!(back.scenes[2].synth_mix, song.scenes[2].synth_mix);
+        assert_eq!(back.scenes[2].drum_mix, song.scenes[2].drum_mix);
         assert_eq!(back.arrangement, song.arrangement);
+    }
+
+    #[test]
+    fn old_files_give_every_scene_the_old_mixer() {
+        let old = r#"{
+            "bpm": 100,
+            "drums": [{"volume": 0.3, "mute": true, "custom": null, "custom_name": ""}],
+            "synths": [{"name": "Bass", "bright": 0.9, "volume": 0.2, "pump": true}],
+            "voices": [{"volume": 0.4, "echo": true}],
+            "scenes": [{"bars": 1, "takes": [{"clip": {"rate": 8000, "pcm16": ""}, "bars": 1}]}, {"bars": 2}]
+        }"#;
+        let song = Song::from_json(old).unwrap();
+        for scene in &song.scenes[..2] {
+            assert_eq!(
+                scene.drum_mix[0],
+                DrumMix {
+                    volume: 0.3,
+                    mute: true
+                }
+            );
+            assert_eq!(scene.drum_mix[1], DrumMix::default());
+            assert_eq!(scene.synth_mix[0].volume, 0.2);
+            assert!(scene.synth_mix[0].pump);
+            assert!(scene.voice_mix[0].echo);
+        }
+        // Scenes the file didn't have get the normal mix.
+        assert_eq!(song.scenes[5].synth_mix, Scene::default().synth_mix);
+        // A take with no tempo is taken to be at the song's tempo.
+        assert_eq!(song.scenes[0].takes[0].as_ref().unwrap().bpm, 100.0);
+    }
+
+    #[test]
+    fn new_scenes_borrow_the_mix_and_chop_but_not_the_pattern() {
+        let mut a = Scene::default();
+        a.synth_mix[0].volume = 0.1;
+        a.chop.sample = Some(0);
+        a.chop.slices = 16;
+        a.chop.hits[3][5] = true;
+        let mut b = Scene::default();
+        b.copy_sounds_from(&a);
+        assert_eq!(b.synth_mix[0].volume, 0.1);
+        assert_eq!((b.chop.sample, b.chop.slices), (Some(0), 16));
+        assert!(!b.chop.has_hits(MAX_STEPS));
+    }
+
+    #[test]
+    fn chop_cuts_the_part_into_equal_slices() {
+        let clip = Clip {
+            rate: 1000,
+            data: Arc::new(vec![0.0; 5000]),
+        };
+        let chop = Chop {
+            start: 1.0,
+            length: 2.0,
+            slices: 4,
+            ..Chop::default()
+        };
+        assert_eq!(chop.slice_range(0, &clip), (1000, 1500));
+        assert_eq!(chop.slice_range(3, &clip), (2500, 3000));
+        // Running off the end of the file just makes the last slices shorter.
+        let late = Chop {
+            start: 4.0,
+            ..chop.clone()
+        };
+        assert_eq!(late.slice_range(3, &clip), (4750, 5000));
+        let mut chop = chop;
+        chop.set(1, 0, true);
+        chop.set(2, 0, true);
+        assert_eq!(chop.hit_at(0), Some(2), "one slice per step");
+        chop.in_order(16);
+        assert_eq!(
+            (0..16).filter_map(|s| chop.hit_at(s)).collect::<Vec<_>>(),
+            [0, 1, 2, 3]
+        );
+        assert_eq!(chop.hit_at(4), Some(1));
+    }
+
+    #[test]
+    fn saving_drops_samples_nobody_uses() {
+        let sample = |name: &str| Sample {
+            name: name.into(),
+            clip: Clip {
+                rate: 8000,
+                data: Arc::new(vec![0.1; 4]),
+            },
+        };
+        let mut song = Song {
+            samples: vec![sample("a"), sample("b"), sample("c")],
+            ..Song::default()
+        };
+        song.scenes[0].chop.sample = Some(2);
+        song.scenes[3].chop.sample = Some(0);
+        song.prune_samples();
+        let names: Vec<_> = song.samples.iter().map(|s| s.name.as_str()).collect();
+        assert_eq!(names, ["a", "c"]);
+        assert_eq!(song.scenes[0].chop.sample, Some(1));
+        assert_eq!(song.scenes[3].chop.sample, Some(0));
     }
 
     #[test]

@@ -17,8 +17,9 @@ use crate::engine::{Cmd, Event, NONE, REC_COUNT_IN, REC_IDLE, REC_RECORDING, tak
 use crate::files::{self, Export};
 use crate::history::History;
 use crate::song::{
-    Clip, DRUM_NAMES, DRUMS, Kit, MAX_ARRANGEMENT, Mood, NOTE_NAMES, Preset, SCENE_NAMES, SCENES,
-    STEPS_PER_BAR, SYNTHS, Scene, Song, Sound, Take, VOICE_LANES, note_name,
+    Clip, DRUM_NAMES, DRUMS, Kit, MAX_ARRANGEMENT, MAX_SAMPLES, Mood, NOTE_NAMES, Preset,
+    SCENE_NAMES, SCENES, SLICE_CHOICES, STEPS_PER_BAR, SYNTH_NAMES, SYNTHS, Sample, Scene, Song,
+    Sound, Take, VOICE_LANES, note_name,
 };
 
 /// Width of the controls left of every grid, so all the grids line up.
@@ -26,6 +27,7 @@ const LEFT_W: f32 = 300.0;
 const DRUM_ROW_H: f32 = 26.0;
 const NOTE_ROW_H: f32 = 17.0;
 const VOICE_ROW_H: f32 = 48.0;
+const REGION_H: f32 = 56.0;
 const WAVE_BINS: usize = 400;
 
 const GO_GREEN: Color32 = Color32::from_rgb(40, 170, 90);
@@ -57,6 +59,7 @@ const SYNTH_COLORS: [Color32; SYNTHS] = [
 ];
 const SYNTH_ICONS: [&str; SYNTHS] = ["🎸", "🎹", "☁"];
 const VOICE_COLOR: Color32 = Color32::from_rgb(255, 110, 140);
+const CHOP_COLOR: Color32 = Color32::from_rgb(250, 165, 70);
 const SCENE_COLORS: [Color32; SCENES] = [
     Color32::from_rgb(255, 120, 90),
     Color32::from_rgb(255, 200, 60),
@@ -87,12 +90,17 @@ enum Drag {
     },
     /// Wiping notes away.
     Erase { track: usize },
+    /// Painting chop slices on (or off).
+    Chop { value: bool },
+    /// Picking the part of a sound file to chop, from `anchor` seconds.
+    Region { anchor: f32 },
 }
 
 struct Recording {
     scene: usize,
     lane: usize,
     bars: usize,
+    bpm: f32,
     since: Instant,
 }
 
@@ -100,6 +108,17 @@ struct Recording {
 struct Wave {
     key: usize,
     peaks: Vec<f32>,
+}
+
+/// Cached outlines for the chop track: the whole file, and each slice.
+#[derive(Default)]
+struct ChopWaves {
+    file_key: usize,
+    file: Vec<f32>,
+    /// Makes the loudest part of the file fill the height.
+    scale: f32,
+    slice_key: Option<(u32, u32, usize)>,
+    slices: Vec<Vec<f32>>,
 }
 
 pub struct OontzApp {
@@ -124,6 +143,7 @@ pub struct OontzApp {
     export_job: Option<mpsc::Receiver<Result<PathBuf, String>>>,
     show_keys: bool,
     waves: Vec<Option<Wave>>,
+    chop_waves: ChopWaves,
 }
 
 impl OontzApp {
@@ -155,6 +175,7 @@ impl OontzApp {
             export_job: None,
             show_keys: false,
             waves: (0..VOICE_LANES).map(|_| None).collect(),
+            chop_waves: ChopWaves::default(),
         }
     }
 }
@@ -182,6 +203,8 @@ impl eframe::App for OontzApp {
                     self.drums(ui);
                     ui.add_space(8.0);
                     self.synths(ui);
+                    ui.add_space(8.0);
+                    self.chop(ui);
                     ui.add_space(8.0);
                     self.voices(ui);
                 });
@@ -244,16 +267,19 @@ impl OontzApp {
                 }
                 fade_edges(&mut data, 64);
                 let rate = audio.mic.as_ref().map_or(audio.sample_rate, |m| m.rate);
-                let bars = self
+                let (bars, bpm) = self
                     .recording
                     .as_ref()
-                    .map_or(self.song.scenes[scene].bars, |r| r.bars);
+                    .map_or((self.song.scenes[scene].bars, self.song.bpm), |r| {
+                        (r.bars, r.bpm)
+                    });
                 self.song.scenes[scene].takes[lane] = Some(Take {
                     clip: Clip {
                         rate,
                         data: Arc::new(data),
                     },
                     bars,
+                    bpm,
                 });
                 self.recording = None;
                 self.status = if loud_enough {
@@ -510,6 +536,7 @@ impl OontzApp {
             scene: self.scene,
             lane,
             bars: self.song.scenes[self.scene].bars,
+            bpm: self.song.bpm,
             since: Instant::now(),
         });
         self.status = "🎤 Get ready… start after the 4 clicks!".into();
@@ -633,7 +660,7 @@ impl OontzApp {
         else {
             return;
         };
-        match files::load_wav(&path) {
+        match files::load_wav(&path, files::DRUM_SECONDS) {
             Ok(clip) => {
                 let drum = &mut self.song.drums[i];
                 drum.custom = Some(clip);
@@ -659,9 +686,7 @@ impl OontzApp {
         if self.waves[lane].as_ref().is_some_and(|w| w.key == key) {
             return;
         }
-        let data = &take.clip.data;
-        let per_bin = data.len().div_ceil(WAVE_BINS).max(1);
-        let peaks = data.chunks(per_bin).map(peak).collect();
+        let peaks = outline(&take.clip.data, WAVE_BINS);
         self.waves[lane] = Some(Wave { key, peaks });
     }
 }
@@ -1156,24 +1181,25 @@ impl OontzApp {
 
     fn drum_controls(&mut self, ui: &mut Ui, i: usize) {
         let color = DRUM_COLORS[i];
-        let drum = &mut self.song.drums[i];
+        let mix = &mut self.song.scenes[self.scene].drum_mix[i];
         let name = RichText::new(DRUM_NAMES[i]).strong().color(Color32::BLACK);
-        let fill = if drum.mute { dim(color) } else { color };
+        let fill = if mix.mute { dim(color) } else { color };
         let hit = ui
             .add(Button::new(name).fill(fill).min_size(vec2(96.0, 22.0)))
             .on_hover_text("Click to hear it")
             .clicked();
-        let mute_icon = if drum.mute { "🔇" } else { "🔊" };
+        let mute_icon = if mix.mute { "🔇" } else { "🔊" };
         if ui
             .add(Button::new(mute_icon).min_size(vec2(30.0, 22.0)))
-            .on_hover_text("Mute")
+            .on_hover_text("Mute in this scene")
             .clicked()
         {
-            drum.mute = !drum.mute;
+            mix.mute = !mix.mute;
         }
         ui.spacing_mut().slider_width = 70.0;
-        ui.add(Slider::new(&mut drum.volume, 0.0..=1.0).show_value(false))
-            .on_hover_text("Volume");
+        ui.add(Slider::new(&mut mix.volume, 0.0..=1.0).show_value(false))
+            .on_hover_text("Volume in this scene");
+        let drum = &mut self.song.drums[i];
         let load_tip = if drum.custom.is_some() {
             format!(
                 "Using \"{}\". Click to pick a different WAV.",
@@ -1217,7 +1243,7 @@ impl OontzApp {
         );
         let painter = ui.painter_at(rect);
         for (row, hits) in scene.drums.iter().enumerate() {
-            let muted = self.song.drums[row].mute;
+            let muted = scene.drum_mix[row].mute;
             for (s, &hit) in hits.iter().enumerate().take(steps) {
                 let fill = if hit {
                     let c = if muted {
@@ -1270,7 +1296,7 @@ impl OontzApp {
                     let text = format!(
                         "{} {}{}",
                         SYNTH_ICONS[t],
-                        self.song.synths[t].name,
+                        SYNTH_NAMES[t],
                         if used { "  •" } else { "" }
                     );
                     let label = RichText::new(text).strong().size(16.0).color(if selected {
@@ -1336,14 +1362,15 @@ impl OontzApp {
             sound.octave += 1;
         }
         ui.add_space(6.0);
-        let track = &mut self.song.synths[t];
+        let track = &mut self.song.scenes[scene_idx].synth_mix[t];
         ui.spacing_mut().slider_width = 70.0;
         ui.label("Bright");
         ui.add(Slider::new(&mut track.bright, 0.0..=1.0).show_value(false));
         ui.label("Volume");
         ui.add(Slider::new(&mut track.volume, 0.0..=1.0).show_value(false));
         let mute_label = if track.mute { "🔇 Muted" } else { "🔊 On" };
-        ui.toggle_value(&mut track.mute, mute_label);
+        ui.toggle_value(&mut track.mute, mute_label)
+            .on_hover_text("Mute in this scene");
         ui.toggle_value(&mut track.echo, "Echo")
             .on_hover_text("Bouncy echo, left and right");
         ui.toggle_value(&mut track.pump, "Pump")
@@ -1467,7 +1494,7 @@ impl OontzApp {
                 painter.rect_filled(cell_rect(rect, s, vis, cw, NOTE_ROW_H).shrink(1.0), 3, fill);
             }
         }
-        let muted = self.song.synths[t].mute;
+        let muted = scene.synth_mix[t].mute;
         for vis in 0..rows {
             let row = rows - 1 - vis;
             for s in 0..steps {
@@ -1531,6 +1558,454 @@ impl OontzApp {
                 }
             }
             _ => {}
+        }
+    }
+
+    fn chop(&mut self, ui: &mut Ui) {
+        section(ui, |ui| {
+            ui.horizontal_wrapped(|ui| {
+                ui.label(RichText::new("✂ CHOP").size(20.0).strong());
+                ui.add_space(12.0);
+                self.chop_controls(ui);
+            });
+            let chop = &self.song.scenes[self.scene].chop;
+            if chop.sample.and_then(|i| self.song.samples.get(i)).is_none() {
+                ui.label(
+                    RichText::new(
+                        "Load a WAV (a drum break, an old record, anything). It gets cut into \
+                         slices you can play back in any order.",
+                    )
+                    .color(DIM_TEXT),
+                );
+                return;
+            }
+            self.update_chop_waves();
+            ui.add_space(4.0);
+            ui.horizontal_top(|ui| {
+                ui.spacing_mut().item_spacing = Vec2::ZERO;
+                fixed_row(ui, REGION_H, |ui| self.region_controls(ui));
+                self.region_strip(ui);
+            });
+            ui.add_space(4.0);
+            let playhead = self.playhead();
+            ui.horizontal_top(|ui| {
+                ui.spacing_mut().item_spacing = Vec2::ZERO;
+                self.slice_keys(ui);
+                self.chop_grid(ui, playhead);
+            });
+        });
+    }
+
+    fn chop_controls(&mut self, ui: &mut Ui) {
+        let scene_idx = self.scene;
+        let (mut load, mut pick) = (false, None);
+        let chop = &self.song.scenes[scene_idx].chop;
+        if !self.song.samples.is_empty() {
+            let current = chop
+                .sample
+                .and_then(|i| self.song.samples.get(i))
+                .map_or("(none)", |s| s.name.as_str());
+            ui.label("Sound");
+            egui::ComboBox::from_id_salt("chop sample")
+                .width(120.0)
+                .selected_text(current)
+                .show_ui(ui, |ui| {
+                    for (i, s) in self.song.samples.iter().enumerate() {
+                        if ui
+                            .selectable_label(chop.sample == Some(i), &s.name)
+                            .clicked()
+                        {
+                            pick = Some(i);
+                        }
+                    }
+                })
+                .response
+                .on_hover_text("Each scene can chop a different sound");
+        }
+        let load_label = if self.song.samples.is_empty() {
+            "📂 Load WAV"
+        } else {
+            "📂"
+        };
+        load |= ui
+            .button(load_label)
+            .on_hover_text("Pick a sound file to chop up")
+            .clicked();
+        if load {
+            self.load_chop_wav();
+        }
+        if let Some(i) = pick {
+            self.use_sample(i);
+        }
+        let steps = self.song.scenes[scene_idx].steps();
+        let chop = &mut self.song.scenes[scene_idx].chop;
+        if chop.sample.is_none() {
+            return;
+        }
+        ui.add_space(6.0);
+        ui.label("Slices");
+        for n in SLICE_CHOICES {
+            if ui
+                .add(Button::selectable(chop.slices == n, n.to_string()))
+                .clicked()
+            {
+                chop.slices = n;
+            }
+        }
+        ui.add_space(6.0);
+        ui.label("Pitch");
+        if ui.add_enabled(chop.pitch > -12, Button::new("−")).clicked() {
+            chop.pitch -= 1;
+        }
+        ui.label(RichText::new(format!("{:+}", chop.pitch)).strong())
+            .on_hover_text("Semitones. Like a record: higher is also faster.");
+        if ui.add_enabled(chop.pitch < 12, Button::new("+")).clicked() {
+            chop.pitch += 1;
+        }
+        ui.add_space(6.0);
+        ui.spacing_mut().slider_width = 70.0;
+        ui.label("Volume");
+        ui.add(Slider::new(&mut chop.volume, 0.0..=1.0).show_value(false));
+        let mute_label = if chop.mute { "🔇 Muted" } else { "🔊 On" };
+        ui.toggle_value(&mut chop.mute, mute_label)
+            .on_hover_text("Mute in this scene");
+        ui.toggle_value(&mut chop.echo, "Echo")
+            .on_hover_text("Bouncy echo, left and right");
+        ui.toggle_value(&mut chop.pump, "Pump")
+            .on_hover_text("Ducks on every beat and swells back");
+        ui.add_space(6.0);
+        if ui
+            .button("▶ In order")
+            .on_hover_text("Every slice once, in order: plays the part as it was")
+            .clicked()
+        {
+            chop.in_order(steps);
+        }
+        if ui
+            .button("🎲 Surprise me")
+            .on_hover_text("Shuffle the slices into a new pattern")
+            .clicked()
+        {
+            chop.shuffle(steps, &mut self.rng);
+        }
+        if ui.button("🗑 Clear").clicked() {
+            chop.clear();
+        }
+    }
+
+    fn load_chop_wav(&mut self) {
+        let Some(path) = rfd::FileDialog::new()
+            .add_filter("WAV sound", &["wav", "WAV"])
+            .set_title("Pick a sound to chop")
+            .pick_file()
+        else {
+            return;
+        };
+        let clip = match files::load_wav(&path, files::SAMPLE_SECONDS) {
+            Ok(clip) if !clip.data.is_empty() => clip,
+            Ok(_) => {
+                self.status = "🤔 That WAV has no sound in it.".into();
+                return;
+            }
+            Err(e) => {
+                self.status = format!("😕 Couldn't read that WAV: {e}");
+                return;
+            }
+        };
+        if self.song.samples.len() >= MAX_SAMPLES {
+            self.song.prune_samples();
+        }
+        if self.song.samples.len() >= MAX_SAMPLES {
+            self.status = format!("That's {MAX_SAMPLES} sounds already! Stop using one first.");
+            return;
+        }
+        let name = path
+            .file_stem()
+            .map_or_else(|| "sound".into(), |s| s.to_string_lossy().into_owned());
+        self.song.samples.push(Sample {
+            name: name.clone(),
+            clip,
+        });
+        self.use_sample(self.song.samples.len() - 1);
+        let long = files::SAMPLE_SECONDS;
+        self.status = format!(
+            "✂ \"{name}\" is cut into slices. Click the grid to play them in any order \
+             (files longer than {long:.0} s are cut short)."
+        );
+    }
+
+    /// Chop sound `i` in this scene, starting with one loop's worth from the top.
+    fn use_sample(&mut self, i: usize) {
+        let loop_secs = self.song.scene_seconds(self.scene);
+        let scene = &mut self.song.scenes[self.scene];
+        if scene.chop.sample == Some(i) {
+            return;
+        }
+        let steps = scene.steps();
+        let clip = &self.song.samples[i].clip;
+        let chop = &mut scene.chop;
+        chop.sample = Some(i);
+        chop.start = 0.0;
+        chop.length = (clip.data.len() as f32 / clip.rate as f32).min(loop_secs);
+        if !chop.has_hits(steps) {
+            chop.in_order(steps);
+        }
+        self.outbox.push(Cmd::PreviewSlice {
+            scene: self.scene,
+            slice: 0,
+        });
+    }
+
+    fn chop_file_seconds(&self) -> f32 {
+        let chop = &self.song.scenes[self.scene].chop;
+        chop.sample
+            .and_then(|i| self.song.samples.get(i))
+            .map_or(0.0, |s| s.clip.data.len() as f32 / s.clip.rate as f32)
+    }
+
+    fn update_chop_waves(&mut self) {
+        let chop = &self.song.scenes[self.scene].chop;
+        let Some(sample) = chop.sample.and_then(|i| self.song.samples.get(i)) else {
+            return;
+        };
+        let data = &sample.clip.data;
+        let key = Arc::as_ptr(data) as usize;
+        let w = &mut self.chop_waves;
+        if w.file_key != key {
+            w.file_key = key;
+            w.file = outline(data, WAVE_BINS * 2);
+            // Quiet files still get a waveform you can see.
+            w.scale = 1.0 / w.file.iter().copied().fold(1e-3, f32::max);
+            for p in &mut w.file {
+                *p *= w.scale;
+            }
+            w.slice_key = None;
+        }
+        let slice_key = (chop.start.to_bits(), chop.length.to_bits(), chop.slices);
+        if w.slice_key != Some(slice_key) {
+            w.slice_key = Some(slice_key);
+            w.slices = (0..chop.slices)
+                .map(|i| {
+                    let (a, b) = chop.slice_range(i, &sample.clip);
+                    let mut peaks = outline(&data[a..b], 48);
+                    for p in &mut peaks {
+                        *p *= w.scale;
+                    }
+                    peaks
+                })
+                .collect();
+        }
+    }
+
+    fn region_controls(&mut self, ui: &mut Ui) {
+        let loop_secs = self.song.scene_seconds(self.scene);
+        let file_secs = self.chop_file_seconds();
+        let chop = &mut self.song.scenes[self.scene].chop;
+        ui.label("From");
+        ui.add(
+            egui::DragValue::new(&mut chop.start)
+                .range(0.0..=file_secs)
+                .speed(0.005)
+                .max_decimals(2)
+                .suffix(" s"),
+        )
+        .on_hover_text("Where the chopped part starts");
+        ui.label("for");
+        ui.add(
+            egui::DragValue::new(&mut chop.length)
+                .range(0.05..=file_secs.max(0.05))
+                .speed(0.005)
+                .max_decimals(2)
+                .suffix(" s"),
+        )
+        .on_hover_text("How long the chopped part is");
+        if ui
+            .button("1 loop")
+            .on_hover_text("Make the part exactly one loop long, so slices land on the beat")
+            .clicked()
+        {
+            chop.length = loop_secs;
+        }
+    }
+
+    /// The whole sound file, with the chopped part lit up. Drag to pick the part.
+    fn region_strip(&mut self, ui: &mut Ui) {
+        let file_secs = self.chop_file_seconds().max(1e-3);
+        let width = ui.available_width().max(120.0);
+        let (rect, resp) = ui.allocate_exact_size(vec2(width, REGION_H), Sense::click_and_drag());
+        let painter = ui.painter_at(rect);
+        let lane = rect.shrink2(vec2(0.0, 3.0));
+        painter.rect_filled(lane, 6, CELL_B);
+        let chop = &self.song.scenes[self.scene].chop;
+        let x_at = |secs: f32| lane.left() + secs / file_secs * width;
+        let (x0, x1) = (
+            x_at(chop.start),
+            x_at(chop.start + chop.length).min(lane.right()),
+        );
+        let part = Rect::from_x_y_ranges(x0..=x1.max(x0 + 1.0), lane.y_range());
+        painter.rect_filled(part, 0, CHOP_COLOR.gamma_multiply(0.18));
+        let peaks = &self.chop_waves.file;
+        let bin_w = width / peaks.len().max(1) as f32;
+        let half = lane.height() * 0.45;
+        for (i, &p) in peaks.iter().enumerate() {
+            let x = lane.left() + (i as f32 + 0.5) * bin_w;
+            let color = if (x0..=x1).contains(&x) {
+                CHOP_COLOR
+            } else {
+                dim(CHOP_COLOR)
+            };
+            let h = (p.min(1.0) * half).max(0.5);
+            painter.line_segment(
+                [pos2(x, lane.center().y - h), pos2(x, lane.center().y + h)],
+                Stroke::new(bin_w.max(1.0), color),
+            );
+        }
+        for k in 1..chop.slices {
+            let x = x0 + (x1 - x0) * k as f32 / chop.slices as f32;
+            painter.line_segment(
+                [pos2(x, lane.top()), pos2(x, lane.bottom())],
+                Stroke::new(1.0, Color32::from_white_alpha(90)),
+            );
+        }
+        painter.rect_stroke(part, 0, Stroke::new(2.0, CHOP_COLOR), StrokeKind::Inside);
+
+        let secs_at = |x: f32| ((x - lane.left()) / width * file_secs).clamp(0.0, file_secs);
+        let resp = resp.on_hover_text("Drag across the part you want to chop. Click to move it.");
+        let chop = &mut self.song.scenes[self.scene].chop;
+        if resp.drag_started()
+            && let Some(origin) = ui.input(|i| i.pointer.press_origin())
+        {
+            self.drag = Some(Drag::Region {
+                anchor: secs_at(origin.x),
+            });
+        }
+        if let Some(Drag::Region { anchor }) = self.drag
+            && resp.dragged()
+            && let Some(pos) = resp.interact_pointer_pos()
+        {
+            let now = secs_at(pos.x);
+            chop.start = anchor.min(now);
+            chop.length = (anchor - now).abs().max(0.05);
+        } else if resp.clicked()
+            && let Some(pos) = resp.interact_pointer_pos()
+        {
+            chop.start = secs_at(pos.x).min((file_secs - chop.length).max(0.0));
+        }
+    }
+
+    /// One key per slice, with a picture of what's in it. Click to hear it.
+    fn slice_keys(&mut self, ui: &mut Ui) {
+        let n = self.song.scenes[self.scene].chop.slices;
+        let rh = chop_row_h(n);
+        let (rect, resp) = ui.allocate_exact_size(vec2(LEFT_W, n as f32 * rh), Sense::click());
+        let painter = ui.painter_at(rect);
+        painter.text(
+            rect.left_center(),
+            Align2::LEFT_CENTER,
+            "click a slice\nto hear it",
+            FontId::proportional(12.0),
+            DIM_TEXT,
+        );
+        let hovered = resp.hover_pos().map(|p| ((p.y - rect.top()) / rh) as usize);
+        for i in 0..n {
+            let key = Rect::from_min_size(
+                pos2(rect.right() - 182.0, rect.top() + i as f32 * rh),
+                vec2(172.0, rh),
+            )
+            .shrink2(vec2(0.0, 1.0));
+            let hot = hovered == Some(i);
+            let fill = if hot {
+                mix(CHOP_COLOR, CELL_B, 0.3)
+            } else {
+                CELL_A
+            };
+            painter.rect_filled(key, 4, fill);
+            let text = if hot {
+                Color32::BLACK
+            } else {
+                Color32::from_gray(220)
+            };
+            painter.text(
+                key.left_center() + vec2(6.0, 0.0),
+                Align2::LEFT_CENTER,
+                (i + 1).to_string(),
+                FontId::proportional(12.0),
+                text,
+            );
+            let Some(peaks) = self.chop_waves.slices.get(i) else {
+                continue;
+            };
+            let wave = Rect::from_min_max(
+                pos2(key.left() + 28.0, key.top() + 2.0),
+                key.right_bottom() - vec2(6.0, 2.0),
+            );
+            let bin_w = wave.width() / peaks.len().max(1) as f32;
+            let color = if hot { Color32::BLACK } else { CHOP_COLOR };
+            for (j, &p) in peaks.iter().enumerate() {
+                let x = wave.left() + (j as f32 + 0.5) * bin_w;
+                let h = (p.min(1.0) * wave.height() * 0.5).max(0.5);
+                painter.line_segment(
+                    [pos2(x, wave.center().y - h), pos2(x, wave.center().y + h)],
+                    Stroke::new((bin_w * 0.8).max(1.0), color),
+                );
+            }
+        }
+        if resp.clicked()
+            && let Some(i) = hovered
+            && i < n
+        {
+            self.outbox.push(Cmd::PreviewSlice {
+                scene: self.scene,
+                slice: i,
+            });
+        }
+    }
+
+    fn chop_grid(&mut self, ui: &mut Ui, playhead: Option<usize>) {
+        let scene = &self.song.scenes[self.scene];
+        let chop = &scene.chop;
+        let steps = scene.steps();
+        let n = chop.slices;
+        let rh = chop_row_h(n);
+        let width = ui.available_width().max(120.0);
+        let cw = width / steps as f32;
+        let (rect, resp) =
+            ui.allocate_exact_size(vec2(width, n as f32 * rh), Sense::click_and_drag());
+        let painter = ui.painter_at(rect);
+        let color = if chop.mute {
+            dim(CHOP_COLOR)
+        } else {
+            CHOP_COLOR
+        };
+        for (i, hits) in chop.hits.iter().enumerate().take(n) {
+            for (s, &hit) in hits.iter().enumerate().take(steps) {
+                let fill = match (hit, playhead == Some(s)) {
+                    (true, true) => mix(color, Color32::WHITE, 0.5),
+                    (true, false) => color,
+                    (false, _) => empty_cell(s, playhead),
+                };
+                painter.rect_filled(cell_rect(rect, s, i, cw, rh).shrink(1.5), 4, fill);
+            }
+        }
+        bar_lines(&painter, rect, steps, cw);
+        let Some((s, row)) = grid_hit(&resp, rect, cw, rh, steps, n) else {
+            return;
+        };
+        let chop = &mut self.song.scenes[self.scene].chop;
+        match self.drag {
+            None => {
+                let value = !chop.hits[row][s];
+                chop.set(row, s, value);
+                self.drag = Some(Drag::Chop { value });
+                if value {
+                    self.outbox.push(Cmd::PreviewSlice {
+                        scene: self.scene,
+                        slice: row,
+                    });
+                }
+            }
+            Some(Drag::Chop { value }) if chop.hits[row][s] != value => chop.set(row, s, value),
+            Some(_) => {}
         }
     }
 
@@ -1622,7 +2097,7 @@ impl OontzApp {
         {
             *take = None;
         }
-        let voice = &mut self.song.voices[lane];
+        let voice = &mut self.song.scenes[self.scene].voice_mix[lane];
         let mute_icon = if voice.mute { "🔇" } else { "🔊" };
         if ui
             .add_enabled(has_take, Button::new(mute_icon).min_size(vec2(28.0, 28.0)))
@@ -1698,7 +2173,7 @@ impl OontzApp {
                 }
             }
         } else if let (Some(wave), Some(take)) = (&self.waves[lane], &scene.takes[lane]) {
-            let color = if self.song.voices[lane].mute {
+            let color = if scene.voice_mix[lane].mute {
                 dim(VOICE_COLOR)
             } else {
                 VOICE_COLOR
@@ -1806,6 +2281,17 @@ fn meter(ui: &mut Ui, level: f32) {
     };
     let bar = Rect::from_min_size(rect.min, vec2(rect.width() * level.sqrt(), rect.height()));
     painter.rect_filled(bar, 3, color);
+}
+
+/// The loudest point in each of about `bins` chunks of a sound, for drawing it.
+fn outline(data: &[f32], bins: usize) -> Vec<f32> {
+    let per_bin = data.len().div_ceil(bins.max(1)).max(1);
+    data.chunks(per_bin).map(peak).collect()
+}
+
+/// Sixteen slices get thinner rows so the grid isn't huge.
+fn chop_row_h(slices: usize) -> f32 {
+    if slices > 8 { NOTE_ROW_H } else { DRUM_ROW_H }
 }
 
 fn cell_rect(rect: Rect, step: usize, row: usize, cw: f32, rh: f32) -> Rect {
