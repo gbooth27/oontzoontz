@@ -7,28 +7,29 @@ use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
 use eframe::egui::{
-    self, Align, Align2, Button, Color32, FontId, Layout, Rect, Response, RichText, Sense, Slider,
-    Stroke, Ui, Vec2, pos2, vec2,
+    self, Align, Align2, Button, Color32, FontId, Key, KeyboardShortcut, Layout, Modifiers, Rect,
+    Response, RichText, Sense, Slider, Stroke, StrokeKind, Ui, Vec2, pos2, vec2,
 };
 
 use crate::audio::Audio;
-use crate::drums::make_kit;
 use crate::dsp::{Rng, fade_edges, normalize, peak};
-use crate::engine::{Cmd, Event, REC_COUNT_IN, REC_IDLE, REC_RECORDING, take_capacity};
-use crate::files;
+use crate::engine::{Cmd, Event, NONE, REC_COUNT_IN, REC_IDLE, REC_RECORDING, take_capacity};
+use crate::files::{self, Export};
+use crate::history::History;
 use crate::song::{
-    Clip, DRUM_NAMES, DRUMS, Kit, Mood, NOTE_NAMES, Preset, STEPS_PER_BAR, SYNTHS, Song,
-    VOICE_LANES, note_name,
+    Clip, DRUM_NAMES, DRUMS, Kit, MAX_ARRANGEMENT, Mood, NOTE_NAMES, Preset, SCENE_NAMES, SCENES,
+    STEPS_PER_BAR, SYNTHS, Scene, Song, Sound, Take, VOICE_LANES, note_name,
 };
 
 /// Width of the controls left of every grid, so all the grids line up.
 const LEFT_W: f32 = 300.0;
-const DRUM_ROW_H: f32 = 28.0;
-const NOTE_ROW_H: f32 = 18.0;
-const VOICE_ROW_H: f32 = 52.0;
+const DRUM_ROW_H: f32 = 26.0;
+const NOTE_ROW_H: f32 = 17.0;
+const VOICE_ROW_H: f32 = 48.0;
 const WAVE_BINS: usize = 400;
 
 const GO_GREEN: Color32 = Color32::from_rgb(40, 170, 90);
+const SONG_BLUE: Color32 = Color32::from_rgb(60, 120, 220);
 const STOP_RED: Color32 = Color32::from_rgb(215, 60, 60);
 const REC_RED: Color32 = Color32::from_rgb(230, 50, 80);
 const YELLOW: Color32 = Color32::from_rgb(255, 196, 0);
@@ -56,6 +57,23 @@ const SYNTH_COLORS: [Color32; SYNTHS] = [
 ];
 const SYNTH_ICONS: [&str; SYNTHS] = ["🎸", "🎹", "☁"];
 const VOICE_COLOR: Color32 = Color32::from_rgb(255, 110, 140);
+const SCENE_COLORS: [Color32; SCENES] = [
+    Color32::from_rgb(255, 120, 90),
+    Color32::from_rgb(255, 200, 60),
+    Color32::from_rgb(120, 220, 120),
+    Color32::from_rgb(80, 200, 230),
+    Color32::from_rgb(120, 150, 255),
+    Color32::from_rgb(190, 130, 255),
+    Color32::from_rgb(255, 130, 200),
+    Color32::from_rgb(200, 200, 200),
+];
+
+/// How the "command" key is written on this computer.
+const CMD: &str = if cfg!(target_os = "macos") {
+    "⌘"
+} else {
+    "Ctrl+"
+};
 
 #[derive(Clone, Copy, Debug)]
 enum Drag {
@@ -71,7 +89,8 @@ enum Drag {
     Erase { track: usize },
 }
 
-struct Take {
+struct Recording {
+    scene: usize,
     lane: usize,
     bars: usize,
     since: Instant,
@@ -85,6 +104,10 @@ struct Wave {
 
 pub struct OontzApp {
     song: Song,
+    /// The scene being edited.
+    scene: usize,
+    history: History,
+    clipboard: Option<Scene>,
     audio: Option<Audio>,
     audio_error: Option<String>,
     /// Commands to send once this frame's song changes have gone out.
@@ -96,10 +119,10 @@ pub struct OontzApp {
     path: Option<PathBuf>,
     out_meter: f32,
     mic_meter: f32,
-    recording: Option<Take>,
+    recording: Option<Recording>,
     export_loops: usize,
     export_job: Option<mpsc::Receiver<Result<PathBuf, String>>>,
-    confirm_new: bool,
+    show_keys: bool,
     waves: Vec<Option<Wave>>,
 }
 
@@ -113,6 +136,9 @@ impl OontzApp {
         };
         OontzApp {
             song,
+            scene: 0,
+            history: History::default(),
+            clipboard: None,
             audio,
             audio_error,
             outbox: Vec::new(),
@@ -127,7 +153,7 @@ impl OontzApp {
             recording: None,
             export_loops: 4,
             export_job: None,
-            confirm_new: false,
+            show_keys: false,
             waves: (0..VOICE_LANES).map(|_| None).collect(),
         }
     }
@@ -142,7 +168,7 @@ impl eframe::App for OontzApp {
 
         let bar_frame = egui::Frame::new()
             .fill(PANEL)
-            .inner_margin(egui::Margin::symmetric(16, 10));
+            .inner_margin(egui::Margin::symmetric(16, 8));
         egui::Panel::top("top")
             .frame(bar_frame)
             .show(ui, |ui| self.top(ui));
@@ -154,16 +180,19 @@ impl eframe::App for OontzApp {
                 .auto_shrink(false)
                 .show(ui, |ui| {
                     self.drums(ui);
-                    ui.add_space(12.0);
+                    ui.add_space(8.0);
                     self.synths(ui);
-                    ui.add_space(12.0);
+                    ui.add_space(8.0);
                     self.voices(ui);
                 });
         });
+        self.shortcuts_window(&ctx);
 
-        if !ctx.input(|i| i.pointer.primary_down()) {
+        let holding = ctx.input(|i| i.pointer.any_down());
+        if !holding {
             self.drag = None;
         }
+        self.history.track(&before, &self.song, holding);
         self.flush(&before);
         let busy = self.recording.is_some()
             || self.export_job.is_some()
@@ -189,9 +218,6 @@ impl OontzApp {
             self.outbox.clear();
             return;
         };
-        if self.song.kit != before.kit {
-            audio.send(Cmd::Kit(make_kit(self.song.kit, audio.sample_rate as f32)));
-        }
         if self.song != *before {
             audio.send(Cmd::Song(Box::new(self.song.clone())));
         }
@@ -204,7 +230,12 @@ impl OontzApp {
         if let Some(audio) = &self.audio {
             while let Ok(event) = audio.events.try_recv() {
                 // Trash just gets dropped, here on the UI thread.
-                let Event::Recorded { lane, mut data } = event else {
+                let Event::Recorded {
+                    scene,
+                    lane,
+                    mut data,
+                } = event
+                else {
                     continue;
                 };
                 let loud_enough = peak(&data) > 0.02;
@@ -213,13 +244,17 @@ impl OontzApp {
                 }
                 fade_edges(&mut data, 64);
                 let rate = audio.mic.as_ref().map_or(audio.sample_rate, |m| m.rate);
-                let bars = self.recording.as_ref().map_or(self.song.bars, |t| t.bars);
-                let voice = &mut self.song.voices[lane];
-                voice.clip = Some(Clip {
-                    rate,
-                    data: Arc::new(data),
+                let bars = self
+                    .recording
+                    .as_ref()
+                    .map_or(self.song.scenes[scene].bars, |r| r.bars);
+                self.song.scenes[scene].takes[lane] = Some(Take {
+                    clip: Clip {
+                        rate,
+                        data: Arc::new(data),
+                    },
+                    bars,
                 });
-                voice.bars = bars;
                 self.recording = None;
                 self.status = if loud_enough {
                     "🎉 Got it! Your voice is in the loop now.".into()
@@ -232,13 +267,17 @@ impl OontzApp {
             let shared = &audio.shared;
             self.out_meter = (self.out_meter * 0.9).max(shared.out_peak.get());
             self.mic_meter = (self.mic_meter * 0.9).max(shared.mic_peak.get());
+            // While the song plays, show whichever scene you are hearing.
+            if audio.is_playing() && shared.song_pos.load(Relaxed) != NONE {
+                self.scene = shared.scene.load(Relaxed).min(SCENES - 1);
+            }
             // If the engine dropped the take (say, someone pressed stop), let go of it too.
             let engine_idle = shared.rec_phase.load(Relaxed) == REC_IDLE;
             if engine_idle
                 && self
                     .recording
                     .as_ref()
-                    .is_some_and(|t| t.since.elapsed() > Duration::from_millis(500))
+                    .is_some_and(|r| r.since.elapsed() > Duration::from_millis(500))
             {
                 self.recording = None;
             }
@@ -263,9 +302,75 @@ impl OontzApp {
         if ctx.egui_wants_keyboard_input() {
             return;
         }
-        // Eat the space so it doesn't also press whatever button has focus.
-        if ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Space)) {
+        let pressed = |mods: Modifiers, key: Key| {
+            ctx.input_mut(|i| i.consume_shortcut(&KeyboardShortcut::new(mods, key)))
+        };
+        let cmd = Modifiers::COMMAND;
+        let cmd_shift = Modifiers::COMMAND | Modifiers::SHIFT;
+        // A shortcut also matches the same keys with Shift held, so check the
+        // Shift versions first.
+        if pressed(cmd_shift, Key::Z) || pressed(cmd, Key::Y) {
+            self.redo();
+        } else if pressed(cmd, Key::Z) {
+            self.undo();
+        }
+        if pressed(cmd_shift, Key::S) {
+            self.save(true);
+        } else if pressed(cmd, Key::S) {
+            self.save(false);
+        }
+        if pressed(cmd, Key::O) {
+            self.open();
+        }
+        if pressed(cmd, Key::N) {
+            self.new_song();
+        }
+        if pressed(cmd, Key::E) {
+            self.export();
+        }
+        if pressed(cmd, Key::D) {
+            self.duplicate_scene();
+        }
+        // Copy, cut and paste usually arrive as their own events, not as keys.
+        let (mut copy, mut cut, mut paste) = ctx.input(|i| {
+            i.events.iter().fold((false, false, false), |(c, x, p), e| {
+                (
+                    c || matches!(e, egui::Event::Copy),
+                    x || matches!(e, egui::Event::Cut),
+                    p || matches!(e, egui::Event::Paste(_)),
+                )
+            })
+        });
+        copy |= pressed(cmd, Key::C);
+        cut |= pressed(cmd, Key::X);
+        paste |= pressed(cmd, Key::V);
+        if cut {
+            self.cut_scene();
+        } else if copy {
+            self.copy_scene();
+        }
+        if paste {
+            self.paste_scene();
+        }
+        if pressed(Modifiers::SHIFT, Key::Space) {
+            self.toggle_song();
+        } else if pressed(Modifiers::NONE, Key::Space) {
             self.toggle_play();
+        }
+        let numbers = [
+            Key::Num1,
+            Key::Num2,
+            Key::Num3,
+            Key::Num4,
+            Key::Num5,
+            Key::Num6,
+            Key::Num7,
+            Key::Num8,
+        ];
+        for (i, key) in numbers.into_iter().enumerate() {
+            if pressed(Modifiers::NONE, key) {
+                self.select_scene(i);
+            }
         }
     }
 
@@ -273,17 +378,115 @@ impl OontzApp {
         self.audio.as_ref().is_some_and(Audio::is_playing)
     }
 
+    fn playing_song(&self) -> bool {
+        self.audio
+            .as_ref()
+            .is_some_and(|a| a.is_playing() && a.shared.song_pos.load(Relaxed) != NONE)
+    }
+
+    /// Step being heard, if it's in the scene on screen.
     fn playhead(&self) -> Option<usize> {
         let audio = self.audio.as_ref().filter(|a| a.is_playing())?;
-        Some(audio.shared.step.load(Relaxed) % self.song.steps())
+        let shared = &audio.shared;
+        (shared.scene.load(Relaxed) == self.scene)
+            .then(|| shared.step.load(Relaxed) % self.song.scenes[self.scene].steps())
     }
 
     fn toggle_play(&mut self) {
         if self.recording.take().is_some() || self.is_playing() {
             self.outbox.push(Cmd::Stop);
         } else {
-            self.outbox.push(Cmd::Play);
+            self.outbox.push(Cmd::Play { scene: self.scene });
         }
+    }
+
+    fn toggle_song(&mut self) {
+        if self.playing_song() || self.recording.take().is_some() {
+            self.outbox.push(Cmd::Stop);
+        } else if self.song.arrangement.is_empty() {
+            self.status =
+                "The song row is empty. Pick a scene and press ➕ Add to put it in.".into();
+        } else {
+            self.outbox.push(Cmd::PlaySong);
+        }
+    }
+
+    /// Edit this scene, and if music is playing, play it next.
+    fn select_scene(&mut self, i: usize) {
+        if i >= SCENES {
+            return;
+        }
+        if i != self.scene && self.song.scenes[i].is_empty() {
+            // A new section starts with the same band as the one you came from.
+            let from = self.song.scenes[self.scene].clone();
+            self.song.scenes[i].copy_sounds_from(&from);
+            self.history.absorb();
+        }
+        self.scene = i;
+        self.outbox.push(Cmd::Queue(i));
+    }
+
+    fn undo(&mut self) {
+        self.status = if self.history.undo(&mut self.song) {
+            "↩ Undone.".into()
+        } else {
+            "Nothing to undo.".into()
+        };
+    }
+
+    fn redo(&mut self) {
+        self.status = if self.history.redo(&mut self.song) {
+            "↪ Redone.".into()
+        } else {
+            "Nothing to redo.".into()
+        };
+    }
+
+    fn copy_scene(&mut self) {
+        self.clipboard = Some(self.song.scenes[self.scene].clone());
+        self.status = format!("📋 Copied scene {}.", SCENE_NAMES[self.scene]);
+    }
+
+    fn cut_scene(&mut self) {
+        self.copy_scene();
+        self.song.scenes[self.scene].clear();
+        self.status = format!("✂ Cut scene {}.", SCENE_NAMES[self.scene]);
+    }
+
+    fn paste_scene(&mut self) {
+        match &self.clipboard {
+            Some(scene) => {
+                self.song.scenes[self.scene] = scene.clone();
+                self.status = format!("📋 Pasted into scene {}.", SCENE_NAMES[self.scene]);
+            }
+            None => self.status = format!("Copy a scene first ({CMD}C)."),
+        }
+    }
+
+    fn clear_scene(&mut self) {
+        self.song.scenes[self.scene].clear();
+        self.status = format!(
+            "🗑 Cleared scene {}. {CMD}Z brings it back.",
+            SCENE_NAMES[self.scene]
+        );
+    }
+
+    /// Copy this scene into the next empty one and jump there.
+    fn duplicate_scene(&mut self) {
+        let target = (1..SCENES)
+            .map(|k| (self.scene + k) % SCENES)
+            .find(|&k| self.song.scenes[k].is_empty());
+        let Some(target) = target else {
+            self.status = "All 8 scenes are full. Clear one first.".into();
+            return;
+        };
+        self.song.scenes[target] = self.song.scenes[self.scene].clone();
+        self.status = format!(
+            "⧉ Copied scene {} into {}. Change it up!",
+            SCENE_NAMES[self.scene], SCENE_NAMES[target]
+        );
+        self.scene = target;
+        self.outbox.push(Cmd::Queue(target));
     }
 
     fn start_record(&mut self, lane: usize) {
@@ -295,16 +498,18 @@ impl OontzApp {
                 return;
             }
         };
-        let loop_secs = self.song.loop_seconds();
+        let loop_secs = self.song.scene_seconds(self.scene);
         self.outbox.push(Cmd::Record {
+            scene: self.scene,
             lane,
             buf: Vec::with_capacity(take_capacity(loop_secs, rate)),
             rate,
             loop_secs,
         });
-        self.recording = Some(Take {
+        self.recording = Some(Recording {
+            scene: self.scene,
             lane,
-            bars: self.song.bars,
+            bars: self.song.scenes[self.scene].bars,
             since: Instant::now(),
         });
         self.status = "🎤 Get ready… start after the 4 clicks!".into();
@@ -316,37 +521,40 @@ impl OontzApp {
         self.status = "Recording cancelled.".into();
     }
 
-    fn stop_everything(&mut self) {
+    fn new_song(&mut self) {
         self.recording = None;
         self.outbox.push(Cmd::Stop);
-    }
-
-    fn new_song(&mut self) {
-        self.stop_everything();
         self.song = Song::default();
+        self.scene = 0;
         self.path = None;
-        self.confirm_new = false;
-        self.status = "🆕 Fresh start. Click some squares!".into();
+        self.status =
+            format!("🆕 Fresh start. Changed your mind? {CMD}Z brings the old song back.");
     }
 
-    fn save(&mut self) {
-        let dialog = rfd::FileDialog::new().add_filter("OontzOontz song", &["oontz"]);
-        let dialog = match self.path.as_deref() {
-            Some(p) => {
-                let d = dialog.set_file_name(file_name(p));
-                match p.parent() {
-                    Some(dir) => d.set_directory(dir),
-                    None => d,
+    fn save(&mut self, pick_new_place: bool) {
+        let path = match (&self.path, pick_new_place) {
+            (Some(path), false) => path.clone(),
+            _ => {
+                let dialog = rfd::FileDialog::new().add_filter("OontzOontz song", &["oontz"]);
+                let dialog = match self.path.as_deref() {
+                    Some(p) => {
+                        let d = dialog.set_file_name(file_name(p));
+                        match p.parent() {
+                            Some(dir) => d.set_directory(dir),
+                            None => d,
+                        }
+                    }
+                    None => dialog.set_file_name("my song.oontz"),
+                };
+                let Some(mut path) = dialog.save_file() else {
+                    return;
+                };
+                if path.extension().is_none() {
+                    path.set_extension("oontz");
                 }
+                path
             }
-            None => dialog.set_file_name("my song.oontz"),
         };
-        let Some(mut path) = dialog.save_file() else {
-            return;
-        };
-        if path.extension().is_none() {
-            path.set_extension("oontz");
-        }
         match self.song.save(&path) {
             Ok(()) => {
                 self.status = format!("💾 Saved {}", file_name(&path));
@@ -365,8 +573,11 @@ impl OontzApp {
         };
         match Song::load(&path) {
             Ok(song) => {
-                self.stop_everything();
+                self.recording = None;
+                self.outbox.push(Cmd::Stop);
                 self.song = song;
+                self.scene = 0;
+                self.history.reset();
                 self.status = format!("📂 Opened {}", file_name(&path));
                 self.path = Some(path);
             }
@@ -374,7 +585,21 @@ impl OontzApp {
         }
     }
 
+    fn export_what(&self) -> Export {
+        if self.song.arrangement.is_empty() {
+            Export::Scene {
+                scene: self.scene,
+                loops: self.export_loops,
+            }
+        } else {
+            Export::Song
+        }
+    }
+
     fn export(&mut self) {
+        if self.export_job.is_some() {
+            return;
+        }
         let name = self
             .path
             .as_deref()
@@ -391,10 +616,10 @@ impl OontzApp {
             path.set_extension("wav");
         }
         let song = self.song.clone();
-        let loops = self.export_loops;
+        let what = self.export_what();
         let (tx, rx) = mpsc::channel();
         std::thread::spawn(move || {
-            let _ = tx.send(files::export_wav(&song, loops, &path).map(|()| path));
+            let _ = tx.send(files::export_wav(&song, what, &path).map(|()| path));
         });
         self.export_job = Some(rx);
         self.status = "⏳ Making your WAV…".into();
@@ -416,23 +641,27 @@ impl OontzApp {
                     .file_stem()
                     .map_or_else(String::new, |s| s.to_string_lossy().into_owned());
                 self.status = format!("🥁 {} is now \"{}\"", DRUM_NAMES[i], drum.custom_name);
-                self.outbox.push(Cmd::PreviewDrum(i));
+                self.outbox.push(Cmd::PreviewDrum {
+                    scene: self.scene,
+                    drum: i,
+                });
             }
             Err(e) => self.status = format!("😕 Couldn't read that WAV: {e}"),
         }
     }
 
     fn update_wave(&mut self, lane: usize) {
-        let Some(clip) = &self.song.voices[lane].clip else {
+        let Some(take) = &self.song.scenes[self.scene].takes[lane] else {
             self.waves[lane] = None;
             return;
         };
-        let key = Arc::as_ptr(&clip.data) as usize;
+        let key = Arc::as_ptr(&take.clip.data) as usize;
         if self.waves[lane].as_ref().is_some_and(|w| w.key == key) {
             return;
         }
-        let per_bin = clip.data.len().div_ceil(WAVE_BINS).max(1);
-        let peaks = clip.data.chunks(per_bin).map(peak).collect();
+        let data = &take.clip.data;
+        let per_bin = data.len().div_ceil(WAVE_BINS).max(1);
+        let peaks = data.chunks(per_bin).map(peak).collect();
         self.waves[lane] = Some(Wave { key, peaks });
     }
 }
@@ -455,72 +684,134 @@ impl OontzApp {
         if let Some(err) = &self.audio_error {
             ui.colored_label(STOP_RED, format!("🔇 No sound: {err}"));
         }
-        ui.add_space(6.0);
+        ui.add_space(4.0);
         ui.horizontal_wrapped(|ui| self.transport(ui));
+        ui.add_space(4.0);
+        ui.horizontal(|ui| self.scenes_row(ui));
+        ui.add_space(2.0);
+        ui.horizontal(|ui| self.song_row(ui));
     }
 
     /// Laid out right to left, so the first button here ends up on the far right.
     fn file_buttons(&mut self, ui: &mut Ui) {
         let exporting = self.export_job.is_some();
+        let (label, tip) = match self.export_what() {
+            Export::Song => ("⬇ Export song", "Make a WAV of the whole song row"),
+            Export::Scene { .. } => (
+                "⬇ Export loop",
+                "Make a WAV of this scene. Put scenes in the song row to export a whole song.",
+            ),
+        };
         if ui
-            .add_enabled(!exporting, Button::new("⬇ Export WAV"))
-            .on_hover_text("Make a WAV file you can share or put in a video")
+            .add_enabled(!exporting, Button::new(label))
+            .on_hover_text(format!("{tip} ({CMD}E)"))
             .clicked()
         {
             self.export();
         }
-        ui.add(
-            egui::DragValue::new(&mut self.export_loops)
-                .range(1..=32)
-                .suffix("× loop"),
-        )
-        .on_hover_text("How many times the loop plays in the WAV");
-        if ui.button("💾 Save").clicked() {
-            self.save();
+        if self.song.arrangement.is_empty() {
+            ui.add(
+                egui::DragValue::new(&mut self.export_loops)
+                    .range(1..=32)
+                    .suffix("× loop"),
+            )
+            .on_hover_text("How many times the loop plays in the WAV");
         }
-        if ui.button("📂 Open").clicked() {
+        if ui
+            .button("💾 Save")
+            .on_hover_text(format!("{CMD}S  ·  save somewhere new: {CMD}⇧S"))
+            .clicked()
+        {
+            self.save(false);
+        }
+        if ui
+            .button("📂 Open")
+            .on_hover_text(format!("{CMD}O"))
+            .clicked()
+        {
             self.open();
         }
-        if self.confirm_new {
-            if ui.button("No").clicked() {
-                self.confirm_new = false;
-            }
-            if ui
-                .button(RichText::new("Yes, start over").color(STOP_RED))
-                .clicked()
-            {
-                self.new_song();
-            }
-            ui.label("Throw this song away?");
-        } else if ui.button("🆕 New").clicked() {
-            self.confirm_new = true;
+        if ui
+            .button("🆕 New")
+            .on_hover_text(format!("{CMD}N"))
+            .clicked()
+        {
+            self.new_song();
+        }
+        ui.add_space(8.0);
+        if ui
+            .add_enabled(self.history.can_redo(), Button::new("↪ Redo"))
+            .on_hover_text(format!("{CMD}⇧Z"))
+            .clicked()
+        {
+            self.redo();
+        }
+        if ui
+            .add_enabled(self.history.can_undo(), Button::new("↩ Undo"))
+            .on_hover_text(format!("{CMD}Z"))
+            .clicked()
+        {
+            self.undo();
+        }
+        if ui
+            .button("⌨ Keys")
+            .on_hover_text("Keyboard shortcuts")
+            .clicked()
+        {
+            self.show_keys = !self.show_keys;
         }
     }
 
     fn transport(&mut self, ui: &mut Ui) {
         let playing = self.is_playing() || self.recording.is_some();
-        let (text, fill) = if playing {
+        let song_mode = self.playing_song();
+        let (text, fill) = if playing && !song_mode {
             ("⏹  STOP", STOP_RED)
         } else {
             ("▶  PLAY", GO_GREEN)
         };
         let play = Button::new(
             RichText::new(text)
-                .size(24.0)
+                .size(22.0)
                 .strong()
                 .color(Color32::WHITE),
         )
         .fill(fill)
         .corner_radius(12)
-        .min_size(vec2(150.0, 50.0));
+        .min_size(vec2(130.0, 44.0));
         if ui
             .add(play)
-            .on_hover_text("The space bar does this too")
+            .on_hover_text("Loop the scene you're editing (space bar)")
             .clicked()
         {
-            self.toggle_play();
+            if song_mode {
+                self.outbox.push(Cmd::Play { scene: self.scene });
+            } else {
+                self.toggle_play();
+            }
         }
-        ui.add_space(12.0);
+        let (text, fill) = if song_mode {
+            ("⏹  STOP", STOP_RED)
+        } else {
+            ("▶  SONG", SONG_BLUE)
+        };
+        let song = Button::new(
+            RichText::new(text)
+                .size(22.0)
+                .strong()
+                .color(Color32::WHITE),
+        )
+        .fill(fill)
+        .corner_radius(12)
+        .min_size(vec2(130.0, 44.0));
+        if ui
+            .add(song)
+            .on_hover_text("Play the song row from the start (shift + space)")
+            .clicked()
+        {
+            self.toggle_song();
+        }
+        ui.add_space(10.0);
         group(ui, "SPEED", |ui| {
             if ui.button("−").clicked() {
                 self.song.bpm = (self.song.bpm - 5.0).max(40.0);
@@ -537,12 +828,13 @@ impl OontzApp {
             }
         });
         group(ui, "SWING", |ui| {
+            ui.spacing_mut().slider_width = 70.0;
             ui.add(Slider::new(&mut self.song.swing, 0.0..=1.0).show_value(false))
                 .on_hover_text("Slide right to make it bounce");
         });
         group(ui, "KEY", |ui| {
             egui::ComboBox::from_id_salt("root")
-                .width(56.0)
+                .width(50.0)
                 .selected_text(NOTE_NAMES[self.song.root as usize])
                 .show_ui(ui, |ui| {
                     for (n, name) in NOTE_NAMES.iter().enumerate() {
@@ -550,7 +842,7 @@ impl OontzApp {
                     }
                 });
             egui::ComboBox::from_id_salt("mood")
-                .width(90.0)
+                .width(80.0)
                 .selected_text(self.song.mood.name())
                 .show_ui(ui, |ui| {
                     for mood in Mood::ALL {
@@ -561,7 +853,8 @@ impl OontzApp {
                 .response
                 .on_hover_text("Every note in the grid fits this mood, so nothing sounds wrong");
         });
-        group(ui, "LOOP LENGTH", |ui| {
+        group(ui, "SCENE LENGTH", |ui| {
+            let scene = &mut self.song.scenes[self.scene];
             for bars in [1, 2, 4] {
                 let label = if bars == 1 {
                     "1 bar".to_string()
@@ -569,21 +862,206 @@ impl OontzApp {
                     format!("{bars} bars")
                 };
                 if ui
-                    .add(Button::selectable(self.song.bars == bars, label))
+                    .add(Button::selectable(scene.bars == bars, label))
                     .clicked()
-                    && self.song.bars != bars
+                    && scene.bars != bars
                 {
-                    self.song.set_bars(bars);
+                    scene.set_bars(bars);
                 }
             }
         });
-        group(ui, "METRONOME", |ui| {
-            ui.toggle_value(&mut self.song.click, "🔔 Click");
+        group(ui, "CLICK", |ui| {
+            ui.toggle_value(&mut self.song.click, "🔔")
+                .on_hover_text("Metronome");
+        });
+        group(ui, "DUST", |ui| {
+            ui.spacing_mut().slider_width = 60.0;
+            ui.add(Slider::new(&mut self.song.dust, 0.0..=1.0).show_value(false))
+                .on_hover_text("Old-record crackle and warmth on everything");
         });
         group(ui, "VOLUME", |ui| {
+            ui.spacing_mut().slider_width = 70.0;
             ui.add(Slider::new(&mut self.song.volume, 0.0..=1.0).show_value(false));
             meter(ui, self.out_meter);
         });
+    }
+
+    fn scenes_row(&mut self, ui: &mut Ui) {
+        ui.label(RichText::new("SCENES").size(11.0).strong().color(DIM_TEXT))
+            .on_hover_text("Each scene is one section of your song: verse, chorus, drop…");
+        let (live, queued, progress) = match &self.audio {
+            Some(a) if a.is_playing() => {
+                let s = &a.shared;
+                let live = s.scene.load(Relaxed).min(SCENES - 1);
+                let steps = self.song.scenes[live].steps();
+                let progress = (s.step.load(Relaxed) % steps) as f32 / steps as f32;
+                let queued = Some(s.queued.load(Relaxed)).filter(|&q| q != NONE);
+                (Some(live), queued, progress)
+            }
+            _ => (None, None, 0.0),
+        };
+        let pulse = 0.5 + 0.5 * (ui.input(|i| i.time) * 8.0).sin() as f32;
+        for i in 0..SCENES {
+            let (rect, resp) = ui.allocate_exact_size(vec2(44.0, 38.0), Sense::click());
+            let painter = ui.painter();
+            let empty = self.song.scenes[i].is_empty();
+            let selected = i == self.scene;
+            let color = SCENE_COLORS[i];
+            let fill = match (empty, selected) {
+                (true, true) => CELL_NOW,
+                (true, false) => CELL_B,
+                (false, true) => color,
+                (false, false) => mix(color, CELL_B, 0.45),
+            };
+            painter.rect_filled(rect, 8, fill);
+            if selected {
+                painter.rect_stroke(
+                    rect,
+                    8,
+                    Stroke::new(2.5, Color32::WHITE),
+                    StrokeKind::Outside,
+                );
+            }
+            if queued == Some(i) {
+                let ring = Stroke::new(2.5, YELLOW.gamma_multiply(pulse));
+                painter.rect_stroke(rect.expand(3.0), 10, ring, StrokeKind::Outside);
+            }
+            let text = if empty { DIM_TEXT } else { Color32::BLACK };
+            painter.text(
+                rect.center() - vec2(0.0, 2.0),
+                Align2::CENTER_CENTER,
+                SCENE_NAMES[i],
+                FontId::proportional(18.0),
+                text,
+            );
+            if live == Some(i) {
+                let bar = Rect::from_min_size(
+                    pos2(rect.left() + 5.0, rect.bottom() - 6.0),
+                    vec2((rect.width() - 10.0) * progress, 3.0),
+                );
+                painter.rect_filled(bar, 1, Color32::WHITE);
+            }
+            let tip = if empty {
+                format!("Scene {} (empty). Key {}", SCENE_NAMES[i], i + 1)
+            } else {
+                format!(
+                    "Scene {}: click to edit it. If music is playing, it plays next. Key {}",
+                    SCENE_NAMES[i],
+                    i + 1
+                )
+            };
+            if resp.on_hover_text(tip).clicked() {
+                self.select_scene(i);
+            }
+        }
+        ui.add_space(10.0);
+        if ui
+            .button("⧉ Duplicate")
+            .on_hover_text(format!("Copy this scene into the next empty one ({CMD}D)"))
+            .clicked()
+        {
+            self.duplicate_scene();
+        }
+        if ui.button("Copy").on_hover_text(format!("{CMD}C")).clicked() {
+            self.copy_scene();
+        }
+        if ui
+            .add_enabled(self.clipboard.is_some(), Button::new("Paste"))
+            .on_hover_text(format!("Replace this scene with the copied one ({CMD}V)"))
+            .clicked()
+        {
+            self.paste_scene();
+        }
+        if ui
+            .button("🗑 Clear scene")
+            .on_hover_text("Wipe this scene's beat, notes and takes")
+            .clicked()
+        {
+            self.clear_scene();
+        }
+    }
+
+    fn song_row(&mut self, ui: &mut Ui) {
+        ui.label(
+            RichText::new("SONG    ")
+                .size(11.0)
+                .strong()
+                .color(DIM_TEXT),
+        )
+        .on_hover_text("The order your scenes play in when you press ▶ SONG");
+        let live = self.audio.as_ref().and_then(|a| {
+            let pos = a.shared.song_pos.load(Relaxed);
+            (a.is_playing() && pos != NONE).then_some(pos)
+        });
+        let add_label = format!("➕ Add {}", SCENE_NAMES[self.scene]);
+        let reserve = 260.0;
+        let mut remove = None;
+        if self.song.arrangement.is_empty() {
+            ui.label(
+                RichText::new("empty: pick a scene, press ➕ Add, repeat. Then press ▶ SONG.")
+                    .color(DIM_TEXT),
+            );
+        } else {
+            egui::ScrollArea::horizontal()
+                .id_salt("song row")
+                .max_width((ui.available_width() - reserve).max(100.0))
+                .show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.spacing_mut().item_spacing.x = 3.0;
+                        for (k, &s) in self.song.arrangement.iter().enumerate() {
+                            let bars = self.song.scenes[s].bars as f32;
+                            let size = vec2(20.0 + 14.0 * bars, 26.0);
+                            let (rect, resp) = ui.allocate_exact_size(size, Sense::click());
+                            let painter = ui.painter();
+                            let here = live == Some(k);
+                            let fill = if here {
+                                SCENE_COLORS[s]
+                            } else {
+                                mix(SCENE_COLORS[s], CELL_B, 0.35)
+                            };
+                            painter.rect_filled(rect, 6, fill);
+                            if here {
+                                painter.rect_stroke(
+                                    rect,
+                                    6,
+                                    Stroke::new(2.0, Color32::WHITE),
+                                    StrokeKind::Outside,
+                                );
+                            }
+                            painter.text(
+                                rect.center(),
+                                Align2::CENTER_CENTER,
+                                SCENE_NAMES[s],
+                                FontId::proportional(14.0),
+                                Color32::BLACK,
+                            );
+                            let tip = format!("Scene {}: click to take it out", SCENE_NAMES[s]);
+                            if resp.on_hover_text(tip).clicked() {
+                                remove = Some(k);
+                            }
+                        }
+                    });
+                });
+        }
+        if let Some(k) = remove {
+            self.song.arrangement.remove(k);
+        }
+        let full = self.song.arrangement.len() >= MAX_ARRANGEMENT;
+        if ui
+            .add_enabled(!full, Button::new(add_label))
+            .on_hover_text("Put the scene you're editing at the end of the song")
+            .clicked()
+        {
+            self.song.arrangement.push(self.scene);
+        }
+        if !self.song.arrangement.is_empty() {
+            if ui.button("🗑").on_hover_text("Empty the song row").clicked() {
+                self.song.arrangement.clear();
+            }
+            let secs = self.song.song_seconds().round() as u32;
+            ui.label(RichText::new(format!("{}:{:02}", secs / 60, secs % 60)).color(DIM_TEXT))
+                .on_hover_text("How long the song is");
+        }
     }
 
     fn status_bar(&mut self, ui: &mut Ui) {
@@ -591,14 +1069,48 @@ impl OontzApp {
             ui.label(&self.status);
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                 ui.label(
-                    RichText::new(
-                        "space = play/stop  ·  drag to paint  ·  every sound here is made from math, free to use",
-                    )
+                    RichText::new(format!(
+                        "space play  ·  ⇧space song  ·  1–8 scenes  ·  {CMD}Z undo  ·  every sound here is made from math, free to use"
+                    ))
                     .small()
                     .color(DIM_TEXT),
                 );
             });
         });
+    }
+
+    fn shortcuts_window(&mut self, ctx: &egui::Context) {
+        let rows: [(String, &str); 16] = [
+            ("Space".into(), "Play / stop the scene"),
+            ("⇧ Space".into(), "Play / stop the song"),
+            ("1 – 8".into(), "Pick scene A – H"),
+            (format!("{CMD}Z"), "Undo"),
+            (format!("{CMD}⇧Z  or  {CMD}Y"), "Redo"),
+            (format!("{CMD}C"), "Copy scene"),
+            (format!("{CMD}X"), "Cut scene"),
+            (format!("{CMD}V"), "Paste scene"),
+            (format!("{CMD}D"), "Duplicate scene"),
+            (format!("{CMD}S"), "Save"),
+            (format!("{CMD}⇧S"), "Save somewhere new"),
+            (format!("{CMD}O"), "Open"),
+            (format!("{CMD}N"), "New song"),
+            (format!("{CMD}E"), "Export WAV"),
+            ("Click + drag".into(), "Paint drums, stretch notes"),
+            ("Click a note".into(), "Remove it"),
+        ];
+        egui::Window::new("⌨ Keyboard shortcuts")
+            .open(&mut self.show_keys)
+            .collapsible(false)
+            .resizable(false)
+            .show(ctx, |ui| {
+                egui::Grid::new("keys").striped(true).show(ui, |ui| {
+                    for (keys, what) in rows {
+                        ui.label(RichText::new(keys).strong().color(YELLOW));
+                        ui.label(what);
+                        ui.end_row();
+                    }
+                });
+            });
     }
 
     fn drums(&mut self, ui: &mut Ui) {
@@ -607,25 +1119,28 @@ impl OontzApp {
                 ui.label(RichText::new("🥁 DRUMS").size(20.0).strong());
                 ui.add_space(12.0);
                 ui.label("Kit");
+                let scene = &mut self.song.scenes[self.scene];
                 egui::ComboBox::from_id_salt("kit")
-                    .selected_text(self.song.kit.label())
+                    .selected_text(scene.kit.label())
                     .show_ui(ui, |ui| {
                         for kit in Kit::ALL {
-                            ui.selectable_value(&mut self.song.kit, kit, kit.label());
+                            ui.selectable_value(&mut scene.kit, kit, kit.label());
                         }
-                    });
+                    })
+                    .response
+                    .on_hover_text("Each scene can use a different kit");
                 if ui
                     .button("🎲 Surprise me")
                     .on_hover_text("Make up a random beat")
                     .clicked()
                 {
-                    self.song.random_beat(&mut self.rng);
+                    scene.random_beat(&mut self.rng);
                 }
                 if ui.button("🗑 Clear").clicked() {
-                    self.song.clear_drums();
+                    scene.clear_drums();
                 }
             });
-            ui.add_space(6.0);
+            ui.add_space(4.0);
             let playhead = self.playhead();
             ui.horizontal_top(|ui| {
                 ui.spacing_mut().item_spacing = Vec2::ZERO;
@@ -645,12 +1160,12 @@ impl OontzApp {
         let name = RichText::new(DRUM_NAMES[i]).strong().color(Color32::BLACK);
         let fill = if drum.mute { dim(color) } else { color };
         let hit = ui
-            .add(Button::new(name).fill(fill).min_size(vec2(96.0, 24.0)))
+            .add(Button::new(name).fill(fill).min_size(vec2(96.0, 22.0)))
             .on_hover_text("Click to hear it")
             .clicked();
         let mute_icon = if drum.mute { "🔇" } else { "🔊" };
         if ui
-            .add(Button::new(mute_icon).min_size(vec2(30.0, 24.0)))
+            .add(Button::new(mute_icon).min_size(vec2(30.0, 22.0)))
             .on_hover_text("Mute")
             .clicked()
         {
@@ -668,12 +1183,12 @@ impl OontzApp {
             "Use your own sound (any WAV file)".into()
         };
         let load = ui
-            .add(Button::new("📂").min_size(vec2(28.0, 24.0)))
+            .add(Button::new("📂").min_size(vec2(28.0, 22.0)))
             .on_hover_text(load_tip)
             .clicked();
         if drum.custom.is_some()
             && ui
-                .add(Button::new("↺").min_size(vec2(28.0, 24.0)))
+                .add(Button::new("↺").min_size(vec2(28.0, 22.0)))
                 .on_hover_text("Back to the built-in sound")
                 .clicked()
         {
@@ -684,12 +1199,16 @@ impl OontzApp {
             self.load_drum_wav(i);
         }
         if hit {
-            self.outbox.push(Cmd::PreviewDrum(i));
+            self.outbox.push(Cmd::PreviewDrum {
+                scene: self.scene,
+                drum: i,
+            });
         }
     }
 
     fn drum_grid(&mut self, ui: &mut Ui, playhead: Option<usize>) {
-        let steps = self.song.steps();
+        let scene = &self.song.scenes[self.scene];
+        let steps = scene.steps();
         let width = ui.available_width().max(120.0);
         let cw = width / steps as f32;
         let (rect, resp) = ui.allocate_exact_size(
@@ -697,10 +1216,11 @@ impl OontzApp {
             Sense::click_and_drag(),
         );
         let painter = ui.painter_at(rect);
-        for (row, drum) in self.song.drums.iter().enumerate() {
-            for s in 0..steps {
-                let fill = if drum.steps[s] {
-                    let c = if drum.mute {
+        for (row, hits) in scene.drums.iter().enumerate() {
+            let muted = self.song.drums[row].mute;
+            for (s, &hit) in hits.iter().enumerate().take(steps) {
+                let fill = if hit {
+                    let c = if muted {
                         dim(DRUM_COLORS[row])
                     } else {
                         DRUM_COLORS[row]
@@ -720,16 +1240,20 @@ impl OontzApp {
         let Some((s, row)) = grid_hit(&resp, rect, cw, DRUM_ROW_H, steps, DRUMS) else {
             return;
         };
+        let hits = &mut self.song.scenes[self.scene].drums[row];
         match self.drag {
             None => {
-                let value = !self.song.drums[row].steps[s];
-                self.song.drums[row].steps[s] = value;
+                let value = !hits[s];
+                hits[s] = value;
                 self.drag = Some(Drag::Paint { value });
                 if value {
-                    self.outbox.push(Cmd::PreviewDrum(row));
+                    self.outbox.push(Cmd::PreviewDrum {
+                        scene: self.scene,
+                        drum: row,
+                    });
                 }
             }
-            Some(Drag::Paint { value }) => self.song.drums[row].steps[s] = value,
+            Some(Drag::Paint { value }) => hits[s] = value,
             Some(_) => {}
         }
     }
@@ -739,19 +1263,14 @@ impl OontzApp {
             ui.horizontal(|ui| {
                 ui.label(RichText::new("🎹 SYNTHS").size(20.0).strong());
                 ui.add_space(12.0);
-                let steps = self.song.steps();
                 for t in 0..SYNTHS {
                     let selected = self.synth_tab == t;
                     let color = SYNTH_COLORS[t];
-                    let track = &self.song.synths[t];
-                    let used = track
-                        .notes
-                        .iter()
-                        .any(|r| r[..steps].iter().any(|&n| n > 0));
+                    let used = self.song.scenes[self.scene].has_notes(t);
                     let text = format!(
                         "{} {}{}",
                         SYNTH_ICONS[t],
-                        track.name,
+                        self.song.synths[t].name,
                         if used { "  •" } else { "" }
                     );
                     let label = RichText::new(text).strong().size(16.0).color(if selected {
@@ -762,16 +1281,16 @@ impl OontzApp {
                     let tab = Button::new(label)
                         .fill(if selected { color } else { CELL_B })
                         .corner_radius(8)
-                        .min_size(vec2(110.0, 30.0));
+                        .min_size(vec2(110.0, 28.0));
                     if ui.add(tab).clicked() {
                         self.synth_tab = t;
                     }
                 }
             });
-            ui.add_space(4.0);
+            ui.add_space(2.0);
             let t = self.synth_tab;
             ui.horizontal_wrapped(|ui| self.synth_controls(ui, t));
-            ui.add_space(6.0);
+            ui.add_space(4.0);
             let playhead = self.playhead();
             ui.horizontal_top(|ui| {
                 ui.spacing_mut().item_spacing = Vec2::ZERO;
@@ -782,25 +1301,43 @@ impl OontzApp {
     }
 
     fn synth_controls(&mut self, ui: &mut Ui, t: usize) {
-        let track = &mut self.song.synths[t];
+        let scene_idx = self.scene;
+        let mood = self.song.mood;
+        let sound = &mut self.song.scenes[scene_idx].sounds[t];
+        let mut picked = false;
         ui.label("Sound");
         egui::ComboBox::from_id_salt(("preset", t))
-            .selected_text(track.preset.label())
+            .width(120.0)
+            .selected_text(sound.preset.label())
             .show_ui(ui, |ui| {
-                for preset in Preset::ALL {
-                    ui.selectable_value(&mut track.preset, preset, preset.label());
+                for (title, bass) in [("LEADS, KEYS & CHORDS", false), ("BASSES", true)] {
+                    ui.label(RichText::new(title).small().strong().color(DIM_TEXT));
+                    for preset in Preset::ALL.into_iter().filter(|p| p.is_bass() == bass) {
+                        let text = format!("{}  ·  {}", preset.label(), preset.hint());
+                        if ui.selectable_label(sound.preset == preset, text).clicked() {
+                            *sound = Sound::new(preset);
+                            picked = true;
+                        }
+                    }
                 }
-            });
-        ui.add_space(8.0);
+            })
+            .response
+            .on_hover_text(format!(
+                "{}. Each scene can use a different sound.",
+                sound.preset.hint()
+            ));
+        ui.add_space(6.0);
         ui.label("Octave");
-        if ui.add_enabled(track.octave > 1, Button::new("−")).clicked() {
-            track.octave -= 1;
+        if ui.add_enabled(sound.octave > 0, Button::new("−")).clicked() {
+            sound.octave -= 1;
         }
-        ui.label(RichText::new(track.octave.to_string()).strong());
-        if ui.add_enabled(track.octave < 6, Button::new("+")).clicked() {
-            track.octave += 1;
+        ui.label(RichText::new(sound.octave.to_string()).strong());
+        if ui.add_enabled(sound.octave < 6, Button::new("+")).clicked() {
+            sound.octave += 1;
         }
-        ui.add_space(8.0);
+        ui.add_space(6.0);
+        let track = &mut self.song.synths[t];
+        ui.spacing_mut().slider_width = 70.0;
         ui.label("Bright");
         ui.add(Slider::new(&mut track.bright, 0.0..=1.0).show_value(false));
         ui.label("Volume");
@@ -809,16 +1346,28 @@ impl OontzApp {
         ui.toggle_value(&mut track.mute, mute_label);
         ui.toggle_value(&mut track.echo, "Echo")
             .on_hover_text("Bouncy echo, left and right");
-        ui.add_space(8.0);
+        ui.toggle_value(&mut track.pump, "Pump")
+            .on_hover_text("Ducks on every beat and swells back, like French house");
+        ui.toggle_value(&mut track.arp, "Arp")
+            .on_hover_text("Plays held chords one note at a time, going up");
+        ui.add_space(6.0);
         if ui
             .button("🎲 Surprise me")
             .on_hover_text("Make up a part for this synth")
             .clicked()
         {
-            self.song.random_notes(t, &mut self.rng);
+            self.song.scenes[scene_idx].random_notes(t, mood, &mut self.rng);
         }
         if ui.button("🗑 Clear").clicked() {
-            self.song.clear_notes(t);
+            self.song.scenes[scene_idx].clear_notes(t);
+        }
+        if picked {
+            // Let them hear the new sound right away.
+            self.outbox.push(Cmd::PreviewNote {
+                scene: scene_idx,
+                track: t,
+                row: mood.degrees(),
+            });
         }
     }
 
@@ -879,8 +1428,8 @@ impl OontzApp {
             painter.text(
                 key.left_center() + vec2(8.0, 0.0),
                 Align2::LEFT_CENTER,
-                note_name(self.song.midi(t, row)),
-                FontId::proportional(13.0),
+                note_name(self.song.midi(self.scene, t, row)),
+                FontId::proportional(12.0),
                 text,
             );
         }
@@ -889,6 +1438,7 @@ impl OontzApp {
             && vis < rows
         {
             self.outbox.push(Cmd::PreviewNote {
+                scene: self.scene,
                 track: t,
                 row: rows - 1 - vis,
             });
@@ -896,7 +1446,8 @@ impl OontzApp {
     }
 
     fn note_grid(&mut self, ui: &mut Ui, t: usize, playhead: Option<usize>) {
-        let steps = self.song.steps();
+        let scene = &self.song.scenes[self.scene];
+        let steps = scene.steps();
         let rows = self.song.mood.rows();
         let width = ui.available_width().max(120.0);
         let cw = width / steps as f32;
@@ -916,11 +1467,11 @@ impl OontzApp {
                 painter.rect_filled(cell_rect(rect, s, vis, cw, NOTE_ROW_H).shrink(1.0), 3, fill);
             }
         }
-        let track = &self.song.synths[t];
+        let muted = self.song.synths[t].mute;
         for vis in 0..rows {
             let row = rows - 1 - vis;
             for s in 0..steps {
-                let len = (track.notes[row][s] as usize).min(steps - s);
+                let len = (scene.notes[t][row][s] as usize).min(steps - s);
                 if len == 0 {
                     continue;
                 }
@@ -930,7 +1481,7 @@ impl OontzApp {
                 )
                 .shrink(2.0);
                 let sounding = playhead.is_some_and(|p| p >= s && p < s + len);
-                let fill = if track.mute {
+                let fill = if muted {
                     dim(color)
                 } else if sounding {
                     mix(color, Color32::WHITE, 0.45)
@@ -949,29 +1500,34 @@ impl OontzApp {
     /// Click empty space to add a note (drag right to make it longer).
     /// Click a note to remove it (drag to remove more).
     fn edit_note(&mut self, t: usize, row: usize, s: usize) {
+        let scene = &mut self.song.scenes[self.scene];
         match self.drag {
             None => {
-                if let Some(start) = self.song.note_at(t, row, s) {
-                    self.song.synths[t].notes[row][start] = 0;
+                if let Some(start) = scene.note_at(t, row, s) {
+                    scene.notes[t][row][start] = 0;
                     self.drag = Some(Drag::Erase { track: t });
                 } else {
-                    self.song.synths[t].notes[row][s] = 1;
+                    scene.notes[t][row][s] = 1;
                     self.drag = Some(Drag::Draw {
                         track: t,
                         row,
                         start: s,
                     });
-                    self.outbox.push(Cmd::PreviewNote { track: t, row });
+                    self.outbox.push(Cmd::PreviewNote {
+                        scene: self.scene,
+                        track: t,
+                        row,
+                    });
                 }
             }
             Some(Drag::Draw { track, row, start }) if track == t => {
                 let want = s.saturating_sub(start) + 1;
-                let len = want.min(self.song.room_for_note(t, row, start));
-                self.song.synths[t].notes[row][start] = len as u8;
+                let len = want.min(scene.room_for_note(t, row, start));
+                scene.notes[t][row][start] = len as u8;
             }
             Some(Drag::Erase { track }) if track == t => {
-                if let Some(start) = self.song.note_at(t, row, s) {
-                    self.song.synths[t].notes[row][start] = 0;
+                if let Some(start) = scene.note_at(t, row, s) {
+                    scene.notes[t][row][start] = 0;
                 }
             }
             _ => {}
@@ -984,21 +1540,23 @@ impl OontzApp {
                 ui.label(RichText::new("🎤 VOICE").size(20.0).strong());
                 ui.add_space(12.0);
                 self.mic_status(ui);
+                ui.label(
+                    RichText::new(
+                        "Press 🔴 Record, wait for 4 clicks, then sing or talk for one loop. Headphones help!",
+                    )
+                    .color(DIM_TEXT),
+                );
             });
-            ui.label(
-                RichText::new(
-                    "Press 🔴 Record. You'll hear 4 clicks, then sing, rap, beatbox or talk \
-                     for one loop. It stops by itself. Headphones help!",
-                )
-                .color(DIM_TEXT),
-            );
-            ui.add_space(6.0);
+            ui.add_space(4.0);
             let playhead = self.playhead();
-            // Lanes with takes, plus one empty lane ready to go.
+            // Lanes with takes in this scene, plus one empty lane ready to go.
             let mut offered_empty = false;
             for lane in 0..VOICE_LANES {
-                let recording_here = self.recording.as_ref().is_some_and(|t| t.lane == lane);
-                if self.song.voices[lane].clip.is_none() && !recording_here {
+                let recording_here = self
+                    .recording
+                    .as_ref()
+                    .is_some_and(|r| r.lane == lane && r.scene == self.scene);
+                if self.song.scenes[self.scene].takes[lane].is_none() && !recording_here {
                     if offered_empty {
                         continue;
                     }
@@ -1035,10 +1593,13 @@ impl OontzApp {
 
     fn voice_controls(&mut self, ui: &mut Ui, lane: usize) {
         let can_record = self.audio.is_some();
-        let rec_here = self.recording.as_ref().is_some_and(|t| t.lane == lane);
+        let rec_here = self
+            .recording
+            .as_ref()
+            .is_some_and(|r| r.lane == lane && r.scene == self.scene);
         let busy = self.recording.is_some();
-        let voice = &mut self.song.voices[lane];
-        let has_take = voice.clip.is_some();
+        let take = &mut self.song.scenes[self.scene].takes[lane];
+        let has_take = take.is_some();
         let rec_button = if rec_here {
             Button::new(RichText::new("⏹ Cancel").strong())
         } else {
@@ -1051,10 +1612,21 @@ impl OontzApp {
                 rec_button.min_size(vec2(96.0, 28.0)),
             )
             .clicked();
+        if ui
+            .add_enabled(
+                has_take && !rec_here,
+                Button::new("🗑").min_size(vec2(28.0, 28.0)),
+            )
+            .on_hover_text("Throw this take away")
+            .clicked()
+        {
+            *take = None;
+        }
+        let voice = &mut self.song.voices[lane];
         let mute_icon = if voice.mute { "🔇" } else { "🔊" };
         if ui
             .add_enabled(has_take, Button::new(mute_icon).min_size(vec2(28.0, 28.0)))
-            .on_hover_text("Mute")
+            .on_hover_text("Mute this lane")
             .clicked()
         {
             voice.mute = !voice.mute;
@@ -1065,16 +1637,6 @@ impl OontzApp {
             Slider::new(&mut voice.volume, 0.0..=1.0).show_value(false),
         );
         ui.add_enabled_ui(has_take, |ui| ui.toggle_value(&mut voice.echo, "Echo"));
-        if ui
-            .add_enabled(
-                has_take && !rec_here,
-                Button::new("🗑").min_size(vec2(28.0, 28.0)),
-            )
-            .on_hover_text("Throw this take away")
-            .clicked()
-        {
-            voice.clip = None;
-        }
         if rec_clicked {
             if rec_here {
                 self.cancel_record();
@@ -1086,7 +1648,8 @@ impl OontzApp {
 
     fn voice_lane(&mut self, ui: &mut Ui, lane: usize, playhead: Option<usize>) {
         self.update_wave(lane);
-        let steps = self.song.steps();
+        let scene = &self.song.scenes[self.scene];
+        let steps = scene.steps();
         let width = ui.available_width().max(120.0);
         let cw = width / steps as f32;
         let (rect, _) = ui.allocate_exact_size(vec2(width, VOICE_ROW_H), Sense::hover());
@@ -1104,8 +1667,10 @@ impl OontzApp {
 
         let mid = lane_rect.center();
         let big = FontId::proportional(18.0);
-        let rec_here = self.recording.as_ref().is_some_and(|t| t.lane == lane);
-        let voice = &self.song.voices[lane];
+        let rec_here = self
+            .recording
+            .as_ref()
+            .is_some_and(|r| r.lane == lane && r.scene == self.scene);
         if rec_here && let Some(audio) = &self.audio {
             let shared = &audio.shared;
             match shared.rec_phase.load(Relaxed) {
@@ -1132,14 +1697,14 @@ impl OontzApp {
                     painter.text(mid, Align2::CENTER_CENTER, "…", big, DIM_TEXT);
                 }
             }
-        } else if let Some(wave) = &self.waves[lane] {
-            let color = if voice.mute {
+        } else if let (Some(wave), Some(take)) = (&self.waves[lane], &scene.takes[lane]) {
+            let color = if self.song.voices[lane].mute {
                 dim(VOICE_COLOR)
             } else {
                 VOICE_COLOR
             };
             // A take as long as the loop fills the lane; a shorter one repeats.
-            let take_w = width * voice.bars as f32 / self.song.bars as f32;
+            let take_w = width * take.bars as f32 / scene.bars as f32;
             let bin_w = take_w / wave.peaks.len().max(1) as f32;
             let half = lane_rect.height() * 0.45;
             let stroke = Stroke::new(bin_w.max(1.0), color);
@@ -1198,7 +1763,7 @@ fn section(ui: &mut Ui, add: impl FnOnce(&mut Ui)) {
     egui::Frame::new()
         .fill(PANEL)
         .corner_radius(14)
-        .inner_margin(egui::Margin::same(14))
+        .inner_margin(egui::Margin::same(12))
         .show(ui, |ui| {
             ui.set_width(ui.available_width());
             add(ui);
@@ -1211,7 +1776,7 @@ fn group(ui: &mut Ui, title: &str, add: impl FnOnce(&mut Ui)) {
         ui.label(RichText::new(title).size(11.0).strong().color(DIM_TEXT));
         ui.horizontal(add);
     });
-    ui.add_space(6.0);
+    ui.add_space(4.0);
 }
 
 /// Exactly `LEFT_W` wide and `height` tall, so rows line up with the grid beside them.

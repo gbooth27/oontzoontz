@@ -1,4 +1,8 @@
 //! The song: everything grug makes. Saved to disk as one JSON file.
+//!
+//! A song has tracks (the "mixer": how loud, muted, effects) and scenes (the
+//! sections: which squares are lit, which notes, which voice takes, and which
+//! sounds play them). The arrangement lists scenes in the order the song plays.
 
 use std::path::Path;
 use std::sync::Arc;
@@ -16,6 +20,10 @@ pub const MAX_ROWS: usize = 15;
 pub const DRUMS: usize = 8;
 pub const SYNTHS: usize = 3;
 pub const VOICE_LANES: usize = 4;
+pub const SCENES: usize = 8;
+pub const SCENE_NAMES: [&str; SCENES] = ["A", "B", "C", "D", "E", "F", "G", "H"];
+/// Longest song row we allow, so a runaway click can't make an hour of music.
+pub const MAX_ARRANGEMENT: usize = 128;
 
 pub const DRUM_NAMES: [&str; DRUMS] = [
     "Kick", "Snare", "Clap", "Hat", "Open Hat", "Tom", "Clave", "Cowbell",
@@ -139,10 +147,14 @@ impl Kit {
 
     pub fn label(self) -> &'static str {
         match self {
-            Kit::Boom => "Boom (deep 808)",
+            Kit::Boom => "808 (deep, boomy)",
             Kit::Punch => "Punch (tight)",
             Kit::Bit => "Bit (video game)",
         }
+    }
+
+    pub fn index(self) -> usize {
+        self as usize
     }
 }
 
@@ -151,23 +163,45 @@ pub enum Preset {
     Pluck,
     Beep,
     Lead,
+    Supersaw,
     Pad,
+    Strings,
+    Choir,
+    Organ,
+    Bell,
+    DustyKeys,
+    Talkbox,
+    Disco,
     Bass,
     Sub,
-    Bell,
-    Organ,
+    Eight08,
+    Squelch,
+    Reese,
+    Wobble,
+    Growl,
 }
 
 impl Preset {
-    pub const ALL: [Preset; 8] = [
+    pub const ALL: [Preset; 19] = [
         Preset::Pluck,
         Preset::Beep,
         Preset::Lead,
+        Preset::Supersaw,
         Preset::Pad,
+        Preset::Strings,
+        Preset::Choir,
+        Preset::Organ,
+        Preset::Bell,
+        Preset::DustyKeys,
+        Preset::Talkbox,
+        Preset::Disco,
         Preset::Bass,
         Preset::Sub,
-        Preset::Bell,
-        Preset::Organ,
+        Preset::Eight08,
+        Preset::Squelch,
+        Preset::Reese,
+        Preset::Wobble,
+        Preset::Growl,
     ];
 
     pub fn label(self) -> &'static str {
@@ -175,11 +209,93 @@ impl Preset {
             Preset::Pluck => "Pluck",
             Preset::Beep => "Beep",
             Preset::Lead => "Big Lead",
+            Preset::Supersaw => "Supersaw",
             Preset::Pad => "Soft Pad",
+            Preset::Strings => "Strings",
+            Preset::Choir => "Choir",
+            Preset::Organ => "Organ",
+            Preset::Bell => "Bell",
+            Preset::DustyKeys => "Dusty Keys",
+            Preset::Talkbox => "Talkbox",
+            Preset::Disco => "Disco Stab",
             Preset::Bass => "Acid Bass",
             Preset::Sub => "Sub Bass",
-            Preset::Bell => "Bell",
-            Preset::Organ => "Organ",
+            Preset::Eight08 => "808 Bass",
+            Preset::Squelch => "Squelch",
+            Preset::Reese => "Reese Bass",
+            Preset::Wobble => "Wobble Bass",
+            Preset::Growl => "Growl Bass",
+        }
+    }
+
+    /// One line on what it sounds like.
+    pub fn hint(self) -> &'static str {
+        match self {
+            Preset::Pluck => "clean and bouncy",
+            Preset::Beep => "video game",
+            Preset::Lead => "classic fat synth",
+            Preset::Supersaw => "huge stacked EDM chords",
+            Preset::Pad => "soft background chords",
+            Preset::Strings => "lush string section",
+            Preset::Choir => "\"aah\" voices",
+            Preset::Organ => "house-music organ",
+            Preset::Bell => "glassy music box",
+            Preset::DustyKeys => "warbly old record, Avalanches-ish",
+            Preset::Talkbox => "robot voice, Daft Punk-ish",
+            Preset::Disco => "filtered French house chords",
+            Preset::Bass => "squelchy 303, LCD Soundsystem-ish",
+            Preset::Sub => "deep and round",
+            Preset::Eight08 => "booming hip-hop / trap bass",
+            Preset::Squelch => "funky gliding synth, Da Funk-ish",
+            Preset::Reese => "dark, wide drum & bass",
+            Preset::Wobble => "wub wub dubstep",
+            Preset::Growl => "angry talking bass, Skrillex-ish",
+        }
+    }
+
+    pub fn is_bass(self) -> bool {
+        matches!(
+            self,
+            Preset::Bass
+                | Preset::Sub
+                | Preset::Eight08
+                | Preset::Squelch
+                | Preset::Reese
+                | Preset::Wobble
+                | Preset::Growl
+        )
+    }
+
+    /// The octave this sound lives in. Picking a sound moves the track there.
+    pub fn octave(self) -> i32 {
+        match self {
+            Preset::Sub | Preset::Eight08 | Preset::Reese | Preset::Wobble | Preset::Growl => 1,
+            Preset::Bass => 2,
+            Preset::Pad
+            | Preset::Strings
+            | Preset::Choir
+            | Preset::Organ
+            | Preset::DustyKeys
+            | Preset::Talkbox
+            | Preset::Disco
+            | Preset::Squelch => 3,
+            Preset::Pluck | Preset::Beep | Preset::Lead | Preset::Supersaw | Preset::Bell => 4,
+        }
+    }
+}
+
+/// Which sound a synth track uses in a scene.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Sound {
+    pub preset: Preset,
+    pub octave: i32,
+}
+
+impl Sound {
+    pub fn new(preset: Preset) -> Self {
+        Sound {
+            preset,
+            octave: preset.octave(),
         }
     }
 }
@@ -237,10 +353,16 @@ impl TryFrom<ClipFile> for Clip {
     }
 }
 
+/// A recorded voice take, and how many bars long its scene was at the time.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Take {
+    pub clip: Clip,
+    pub bars: usize,
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct DrumTrack {
-    pub steps: Vec<bool>,
     pub volume: f32,
     pub mute: bool,
     /// A WAV the user loaded to replace the built-in sound.
@@ -251,7 +373,6 @@ pub struct DrumTrack {
 impl Default for DrumTrack {
     fn default() -> Self {
         DrumTrack {
-            steps: vec![false; MAX_STEPS],
             volume: 0.8,
             mute: false,
             custom: None,
@@ -264,28 +385,27 @@ impl Default for DrumTrack {
 #[serde(default)]
 pub struct SynthTrack {
     pub name: String,
-    pub preset: Preset,
-    pub octave: i32,
     /// 0.0 = dark, 1.0 = bright. Moves the filter.
     pub bright: f32,
     pub volume: f32,
     pub mute: bool,
     pub echo: bool,
-    /// `notes[row][step]` = note length in steps, 0 = no note starts here.
-    pub notes: Vec<Vec<u8>>,
+    /// Duck on every beat, like French house.
+    pub pump: bool,
+    /// Play held chords one note at a time.
+    pub arp: bool,
 }
 
 impl Default for SynthTrack {
     fn default() -> Self {
         SynthTrack {
             name: "Synth".into(),
-            preset: Preset::Pluck,
-            octave: 4,
             bright: 0.5,
             volume: 0.7,
             mute: false,
             echo: false,
-            notes: vec![vec![0; MAX_STEPS]; MAX_ROWS],
+            pump: false,
+            arp: false,
         }
     }
 }
@@ -293,9 +413,6 @@ impl Default for SynthTrack {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct VoiceTrack {
-    pub clip: Option<Clip>,
-    /// How many bars long the loop was when this was recorded.
-    pub bars: usize,
     pub volume: f32,
     pub mute: bool,
     pub echo: bool,
@@ -304,8 +421,6 @@ pub struct VoiceTrack {
 impl Default for VoiceTrack {
     fn default() -> Self {
         VoiceTrack {
-            clip: None,
-            bars: 1,
             volume: 0.8,
             mute: false,
             echo: false,
@@ -313,95 +428,61 @@ impl Default for VoiceTrack {
     }
 }
 
+/// One section of the song: a loop with its own beat, notes, voice takes and sounds.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
-pub struct Song {
-    pub bpm: f32,
-    /// 0.0 = straight, 1.0 = max bounce.
-    pub swing: f32,
+pub struct Scene {
     pub bars: usize,
-    /// 0 = C … 11 = B.
-    pub root: u8,
-    pub mood: Mood,
-    pub volume: f32,
     pub kit: Kit,
-    /// Metronome while playing.
-    pub click: bool,
-    pub drums: Vec<DrumTrack>,
-    pub synths: Vec<SynthTrack>,
-    pub voices: Vec<VoiceTrack>,
+    /// `sounds[synth]`
+    pub sounds: Vec<Sound>,
+    /// `drums[drum][step]`
+    pub drums: Vec<Vec<bool>>,
+    /// `notes[synth][row][step]` = note length in steps, 0 = no note starts here.
+    pub notes: Vec<Vec<Vec<u8>>>,
+    /// `takes[lane]`
+    pub takes: Vec<Option<Take>>,
 }
 
-impl Default for Song {
+const DEFAULT_SOUNDS: [Preset; SYNTHS] = [Preset::Bass, Preset::Pluck, Preset::Pad];
+
+impl Default for Scene {
     fn default() -> Self {
-        let synth = |name: &str, preset, octave, volume| SynthTrack {
-            name: name.into(),
-            preset,
-            octave,
-            volume,
-            ..SynthTrack::default()
-        };
-        Song {
-            bpm: 110.0,
-            swing: 0.0,
+        Scene {
             bars: 1,
-            root: 9,
-            mood: Mood::Chill,
-            volume: 0.8,
             kit: Kit::Boom,
-            click: false,
-            drums: vec![DrumTrack::default(); DRUMS],
-            synths: vec![
-                synth("Bass", Preset::Bass, 2, 0.7),
-                synth("Lead", Preset::Pluck, 4, 0.6),
-                synth("Pad", Preset::Pad, 3, 0.5),
-            ],
-            voices: vec![VoiceTrack::default(); VOICE_LANES],
+            sounds: DEFAULT_SOUNDS.map(Sound::new).to_vec(),
+            drums: vec![vec![false; MAX_STEPS]; DRUMS],
+            notes: vec![vec![vec![0; MAX_STEPS]; MAX_ROWS]; SYNTHS],
+            takes: vec![None; VOICE_LANES],
         }
     }
 }
 
-impl Song {
-    /// What you hear the first time you press play.
-    pub fn starter() -> Song {
-        let mut song = Song::default();
-        let beat: [(usize, &[usize]); 4] = [
-            (KICK, &[0, 8, 10]),
-            (CLAP, &[4, 12]),
-            (HAT, &[0, 2, 4, 6, 8, 10, 12]),
-            (OPEN_HAT, &[14]),
-        ];
-        for (drum, steps) in beat {
-            for &s in steps {
-                song.drums[drum].steps[s] = true;
-            }
-        }
-        let fifth = song.mood.fifth_row();
-        let top = song.mood.degrees() - 1;
-        for (row, step, len) in [(0, 0, 3), (0, 6, 1), (fifth, 8, 3), (top, 12, 2)] {
-            song.synths[0].notes[row][step] = len;
-        }
-        song
-    }
-
+impl Scene {
     pub fn steps(&self) -> usize {
         self.bars * STEPS_PER_BAR
     }
 
-    pub fn step_seconds(&self) -> f32 {
-        15.0 / self.bpm
+    /// Nothing to hear: no hits, no notes, no takes.
+    pub fn is_empty(&self) -> bool {
+        let steps = self.steps();
+        self.drums.iter().all(|d| !d[..steps].contains(&true))
+            && (0..SYNTHS).all(|t| !self.has_notes(t))
+            && self.takes.iter().all(Option::is_none)
     }
 
-    pub fn loop_seconds(&self) -> f32 {
-        self.steps() as f32 * self.step_seconds()
+    pub fn has_notes(&self, track: usize) -> bool {
+        let steps = self.steps();
+        self.notes[track]
+            .iter()
+            .any(|r| r[..steps].iter().any(|&n| n > 0))
     }
 
-    pub fn midi(&self, track: usize, row: usize) -> i32 {
-        12 * (self.synths[track].octave + 1) + self.root as i32 + self.mood.semitone(row)
-    }
-
-    pub fn freq(&self, track: usize, row: usize) -> f32 {
-        midi_to_freq(self.midi(track, row))
+    /// Use another scene's kit and sounds (a new section starts with the same band).
+    pub fn copy_sounds_from(&mut self, other: &Scene) {
+        self.kit = other.kit;
+        self.sounds.clone_from(&other.sounds);
     }
 
     /// Change the loop length. Growing copies what is already there, so the
@@ -413,22 +494,18 @@ impl Song {
         if new > old {
             for d in &mut self.drums {
                 for s in old..new {
-                    d.steps[s] = d.steps[s % old];
+                    d[s] = d[s % old];
                 }
             }
-            for t in &mut self.synths {
-                for row in &mut t.notes {
-                    for s in old..new {
-                        row[s] = row[s % old];
-                    }
+            for row in self.notes.iter_mut().flatten() {
+                for s in old..new {
+                    row[s] = row[s % old];
                 }
             }
         } else {
-            for t in &mut self.synths {
-                for row in &mut t.notes {
-                    for (s, len) in row.iter_mut().enumerate().take(new) {
-                        *len = (*len).min((new - s) as u8);
-                    }
+            for row in self.notes.iter_mut().flatten() {
+                for (s, len) in row.iter_mut().enumerate().take(new) {
+                    *len = (*len).min((new - s) as u8);
                 }
             }
         }
@@ -436,31 +513,36 @@ impl Song {
 
     /// Start step of the note covering `step` in this row, if any.
     pub fn note_at(&self, track: usize, row: usize, step: usize) -> Option<usize> {
-        let notes = &self.synths[track].notes[row];
-        (0..=step.min(MAX_STEPS - 1))
-            .rev()
-            .find(|&s| notes[s] > 0)
-            .filter(|&s| s + notes[s] as usize > step)
+        note_covering(&self.notes[track][row], step)
     }
 
     /// Longest a note starting at `start` can be before it bumps into the
     /// next note or the end of the loop.
     pub fn room_for_note(&self, track: usize, row: usize, start: usize) -> usize {
-        let notes = &self.synths[track].notes[row];
+        let notes = &self.notes[track][row];
         let end = self.steps();
         (start + 1..end).find(|&s| notes[s] > 0).unwrap_or(end) - start
     }
 
     pub fn clear_drums(&mut self) {
         for d in &mut self.drums {
-            d.steps.fill(false);
+            d.fill(false);
         }
     }
 
     pub fn clear_notes(&mut self, track: usize) {
-        for row in &mut self.synths[track].notes {
+        for row in &mut self.notes[track] {
             row.fill(0);
         }
+    }
+
+    /// Wipe the beat, notes and takes but keep the sounds and length.
+    pub fn clear(&mut self) {
+        self.clear_drums();
+        for t in 0..SYNTHS {
+            self.clear_notes(t);
+        }
+        self.takes.fill(None);
     }
 
     /// Roll the dice for a beat that still sounds like a beat.
@@ -519,7 +601,7 @@ impl Song {
             }
         }
         for (d, row) in self.drums.iter_mut().zip(pat) {
-            for (s, on) in d.steps.iter_mut().enumerate() {
+            for (s, on) in d.iter_mut().enumerate() {
                 *on = row[s % STEPS_PER_BAR];
             }
         }
@@ -527,11 +609,11 @@ impl Song {
 
     /// Make up a two-bar part for a synth track. Track 0 plays bass,
     /// track 1 a melody, track 2 chords.
-    pub fn random_notes(&mut self, track: usize, rng: &mut Rng) {
+    pub fn random_notes(&mut self, track: usize, mood: Mood, rng: &mut Rng) {
         const PHRASE: usize = STEPS_PER_BAR * 2;
-        let n = self.mood.degrees();
-        let rows = self.mood.rows();
-        let fifth = self.mood.fifth_row();
+        let n = mood.degrees();
+        let rows = mood.rows();
+        let fifth = mood.fifth_row();
         let mut pat = vec![[0u8; PHRASE]; MAX_ROWS];
         match track {
             0 => {
@@ -589,7 +671,7 @@ impl Song {
             }
         }
         let steps = self.steps();
-        let notes = &mut self.synths[track].notes;
+        let notes = &mut self.notes[track];
         for (row, pat_row) in notes.iter_mut().zip(&pat) {
             for (s, len) in row.iter_mut().enumerate() {
                 *len = pat_row[s % PHRASE];
@@ -609,33 +691,163 @@ impl Song {
         }
     }
 
+    fn sanitize(&mut self) {
+        self.bars = self.bars.clamp(1, MAX_BARS);
+        let mut defaults = DEFAULT_SOUNDS.into_iter().skip(self.sounds.len());
+        self.sounds.resize_with(SYNTHS, || {
+            Sound::new(defaults.next().unwrap_or(Preset::Pluck))
+        });
+        for sound in &mut self.sounds {
+            sound.octave = sound.octave.clamp(0, 7);
+        }
+        self.drums.resize_with(DRUMS, || vec![false; MAX_STEPS]);
+        for d in &mut self.drums {
+            d.resize(MAX_STEPS, false);
+        }
+        self.notes
+            .resize_with(SYNTHS, || vec![vec![0; MAX_STEPS]; MAX_ROWS]);
+        for track in &mut self.notes {
+            track.resize_with(MAX_ROWS, || vec![0; MAX_STEPS]);
+            for row in track {
+                row.resize(MAX_STEPS, 0);
+            }
+        }
+        self.takes.resize(VOICE_LANES, None);
+        for take in self.takes.iter_mut().flatten() {
+            take.bars = take.bars.clamp(1, MAX_BARS);
+        }
+    }
+}
+
+/// Start of the note covering `step` in one row of a note grid.
+pub fn note_covering(row: &[u8], step: usize) -> Option<usize> {
+    (0..=step.min(row.len().saturating_sub(1)))
+        .rev()
+        .find(|&s| row[s] > 0)
+        .filter(|&s| s + row[s] as usize > step)
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Song {
+    pub bpm: f32,
+    /// 0.0 = straight, 1.0 = max bounce.
+    pub swing: f32,
+    /// 0 = C … 11 = B.
+    pub root: u8,
+    pub mood: Mood,
+    pub volume: f32,
+    /// Old-record crackle and warmth on everything, 0.0 to 1.0.
+    pub dust: f32,
+    /// Metronome while playing.
+    pub click: bool,
+    pub drums: Vec<DrumTrack>,
+    pub synths: Vec<SynthTrack>,
+    pub voices: Vec<VoiceTrack>,
+    pub scenes: Vec<Scene>,
+    /// Scene numbers, in the order the song plays them.
+    pub arrangement: Vec<usize>,
+}
+
+impl Default for Song {
+    fn default() -> Self {
+        let synth = |name: &str, volume| SynthTrack {
+            name: name.into(),
+            volume,
+            ..SynthTrack::default()
+        };
+        Song {
+            bpm: 110.0,
+            swing: 0.0,
+            root: 9,
+            mood: Mood::Chill,
+            volume: 0.8,
+            dust: 0.0,
+            click: false,
+            drums: vec![DrumTrack::default(); DRUMS],
+            synths: vec![synth("Bass", 0.7), synth("Lead", 0.6), synth("Pad", 0.5)],
+            voices: vec![VoiceTrack::default(); VOICE_LANES],
+            scenes: vec![Scene::default(); SCENES],
+            arrangement: Vec::new(),
+        }
+    }
+}
+
+impl Song {
+    /// What you hear the first time you press play.
+    pub fn starter() -> Song {
+        let mut song = Song::default();
+        let fifth = song.mood.fifth_row();
+        let top = song.mood.degrees() - 1;
+        let scene = &mut song.scenes[0];
+        let beat: [(usize, &[usize]); 4] = [
+            (KICK, &[0, 8, 10]),
+            (CLAP, &[4, 12]),
+            (HAT, &[0, 2, 4, 6, 8, 10, 12]),
+            (OPEN_HAT, &[14]),
+        ];
+        for (drum, steps) in beat {
+            for &s in steps {
+                scene.drums[drum][s] = true;
+            }
+        }
+        for (row, step, len) in [(0, 0, 3), (0, 6, 1), (fifth, 8, 3), (top, 12, 2)] {
+            scene.notes[0][row][step] = len;
+        }
+        song
+    }
+
+    pub fn step_seconds(&self) -> f32 {
+        15.0 / self.bpm
+    }
+
+    pub fn scene_seconds(&self, scene: usize) -> f32 {
+        self.scenes[scene].steps() as f32 * self.step_seconds()
+    }
+
+    /// How long the whole song row lasts.
+    pub fn song_seconds(&self) -> f32 {
+        self.arrangement
+            .iter()
+            .map(|&s| self.scene_seconds(s))
+            .sum()
+    }
+
+    pub fn midi(&self, scene: usize, track: usize, row: usize) -> i32 {
+        let octave = self.scenes[scene].sounds[track].octave;
+        12 * (octave + 1) + self.root as i32 + self.mood.semitone(row)
+    }
+
+    pub fn freq(&self, scene: usize, track: usize, row: usize) -> f32 {
+        midi_to_freq(self.midi(scene, track, row))
+    }
+
     /// Fix anything odd in a loaded file instead of crashing on it.
     pub fn sanitize(&mut self) {
         self.bpm = self.bpm.clamp(40.0, 220.0);
         self.swing = self.swing.clamp(0.0, 1.0);
-        self.bars = self.bars.clamp(1, MAX_BARS);
         self.root %= 12;
         self.volume = self.volume.clamp(0.0, 1.0);
+        self.dust = self.dust.clamp(0.0, 1.0);
         self.drums.resize_with(DRUMS, DrumTrack::default);
         for d in &mut self.drums {
-            d.steps.resize(MAX_STEPS, false);
             d.volume = d.volume.clamp(0.0, 1.0);
         }
         self.synths.resize_with(SYNTHS, SynthTrack::default);
         for t in &mut self.synths {
-            t.notes.resize_with(MAX_ROWS, || vec![0; MAX_STEPS]);
-            for row in &mut t.notes {
-                row.resize(MAX_STEPS, 0);
-            }
-            t.octave = t.octave.clamp(0, 7);
             t.bright = t.bright.clamp(0.0, 1.0);
             t.volume = t.volume.clamp(0.0, 1.0);
         }
         self.voices.resize_with(VOICE_LANES, VoiceTrack::default);
         for v in &mut self.voices {
-            v.bars = v.bars.clamp(1, MAX_BARS);
             v.volume = v.volume.clamp(0.0, 1.0);
         }
+        self.scenes.resize_with(SCENES, Scene::default);
+        for scene in &mut self.scenes {
+            scene.sanitize();
+        }
+        self.arrangement.retain(|&s| s < SCENES);
+        self.arrangement.truncate(MAX_ARRANGEMENT);
     }
 
     pub fn save(&self, path: &Path) -> Result<(), String> {
@@ -673,36 +885,37 @@ mod tests {
     #[test]
     fn growing_the_loop_copies_the_beat() {
         let mut song = Song::starter();
-        song.set_bars(4);
-        assert_eq!(song.steps(), 64);
-        for d in &song.drums {
+        let scene = &mut song.scenes[0];
+        scene.set_bars(4);
+        assert_eq!(scene.steps(), 64);
+        for d in &scene.drums {
             for s in 16..64 {
-                assert_eq!(d.steps[s], d.steps[s % 16]);
+                assert_eq!(d[s], d[s % 16]);
             }
         }
-        assert_eq!(song.synths[0].notes[0][16], 3);
+        assert_eq!(scene.notes[0][0][16], 3);
     }
 
     #[test]
     fn shrinking_the_loop_trims_long_notes() {
-        let mut song = Song::default();
-        song.set_bars(2);
-        song.synths[1].notes[0][14] = 6;
-        song.set_bars(1);
-        assert_eq!(song.synths[1].notes[0][14], 2);
+        let mut scene = Scene::default();
+        scene.set_bars(2);
+        scene.notes[1][0][14] = 6;
+        scene.set_bars(1);
+        assert_eq!(scene.notes[1][0][14], 2);
     }
 
     #[test]
     fn finds_notes_and_room() {
-        let mut song = Song::default();
-        song.synths[1].notes[2][4] = 3;
-        song.synths[1].notes[2][10] = 1;
-        assert_eq!(song.note_at(1, 2, 4), Some(4));
-        assert_eq!(song.note_at(1, 2, 6), Some(4));
-        assert_eq!(song.note_at(1, 2, 7), None);
-        assert_eq!(song.note_at(1, 2, 3), None);
-        assert_eq!(song.room_for_note(1, 2, 4), 6);
-        assert_eq!(song.room_for_note(1, 2, 12), 4);
+        let mut scene = Scene::default();
+        scene.notes[1][2][4] = 3;
+        scene.notes[1][2][10] = 1;
+        assert_eq!(scene.note_at(1, 2, 4), Some(4));
+        assert_eq!(scene.note_at(1, 2, 6), Some(4));
+        assert_eq!(scene.note_at(1, 2, 7), None);
+        assert_eq!(scene.note_at(1, 2, 3), None);
+        assert_eq!(scene.room_for_note(1, 2, 4), 6);
+        assert_eq!(scene.room_for_note(1, 2, 12), 4);
     }
 
     #[test]
@@ -710,21 +923,17 @@ mod tests {
         let mut rng = Rng::new(7);
         for bars in [1, 2, 4] {
             for _ in 0..50 {
-                let mut song = Song {
-                    mood: Mood::ALL[rng.range(0, 5) as usize],
-                    ..Song::default()
-                };
-                song.set_bars(bars);
-                song.random_beat(&mut rng);
+                let mood = Mood::ALL[rng.range(0, 5) as usize];
+                let mut scene = Scene::default();
+                scene.set_bars(bars);
+                scene.random_beat(&mut rng);
                 for t in 0..SYNTHS {
-                    song.random_notes(t, &mut rng);
+                    scene.random_notes(t, mood, &mut rng);
                     for row in 0..MAX_ROWS {
-                        for s in 0..song.steps() {
-                            if let Some(start) = song.note_at(t, row, s) {
-                                assert!(
-                                    start + song.synths[t].notes[row][start] as usize
-                                        <= song.steps()
-                                );
+                        for s in 0..scene.steps() {
+                            if let Some(start) = scene.note_at(t, row, s) {
+                                let end = start + scene.notes[t][row][start] as usize;
+                                assert!(end <= scene.steps());
                             }
                         }
                     }
@@ -734,30 +943,85 @@ mod tests {
     }
 
     #[test]
+    fn scenes_know_when_they_are_empty() {
+        let mut song = Song::starter();
+        assert!(!song.scenes[0].is_empty());
+        assert!(song.scenes[1..].iter().all(Scene::is_empty));
+        assert!(song.scenes[0].has_notes(0));
+        assert!(!song.scenes[0].has_notes(1));
+        song.scenes[0].clear();
+        assert!(song.scenes[0].is_empty());
+    }
+
+    #[test]
+    fn scenes_can_borrow_sounds() {
+        let mut a = Scene {
+            kit: Kit::Bit,
+            ..Scene::default()
+        };
+        a.sounds[1] = Sound::new(Preset::Strings);
+        let mut b = Scene::default();
+        b.copy_sounds_from(&a);
+        assert_eq!(b.kit, Kit::Bit);
+        assert_eq!(b.sounds[1].preset, Preset::Strings);
+        assert_eq!(b.sounds[1].octave, Preset::Strings.octave());
+    }
+
+    #[test]
+    fn song_length_adds_up_scenes() {
+        let mut song = Song::starter();
+        song.bpm = 120.0;
+        song.scenes[1].set_bars(4);
+        song.arrangement = vec![0, 1, 0];
+        assert!((song.song_seconds() - (2.0 + 8.0 + 2.0)).abs() < 1e-4);
+    }
+
+    #[test]
     fn save_and_load_round_trip() {
         let mut song = Song::starter();
-        song.voices[2].clip = Some(Clip {
-            rate: 22_050,
-            data: Arc::new(vec![0.0, 0.5, -0.5, 0.25]),
+        song.arrangement = vec![0, 0, 2];
+        song.scenes[2].sounds[0] = Sound::new(Preset::Eight08);
+        song.scenes[2].takes[1] = Some(Take {
+            clip: Clip {
+                rate: 22_050,
+                data: Arc::new(vec![0.0, 0.5, -0.5, 0.25]),
+            },
+            bars: 2,
         });
         let json = serde_json::to_string(&song).unwrap();
         let mut back: Song = serde_json::from_str(&json).unwrap();
         back.sanitize();
-        let clip = back.voices[2].clip.as_ref().unwrap();
-        assert_eq!(clip.rate, 22_050);
-        assert!((clip.data[1] - 0.5).abs() < 1e-3);
-        assert_eq!(back.drums, song.drums);
+        let take = back.scenes[2].takes[1].as_ref().unwrap();
+        assert_eq!(take.clip.rate, 22_050);
+        assert_eq!(take.bars, 2);
+        assert!((take.clip.data[1] - 0.5).abs() < 1e-3);
+        assert_eq!(back.scenes[0], song.scenes[0]);
+        assert_eq!(back.scenes[2].sounds, song.scenes[2].sounds);
         assert_eq!(back.synths, song.synths);
+        assert_eq!(back.arrangement, song.arrangement);
     }
 
     #[test]
     fn junk_files_get_fixed_up() {
-        let mut song: Song =
-            serde_json::from_str(r#"{"bpm": 9000, "bars": 99, "drums": []}"#).unwrap();
+        let mut song: Song = serde_json::from_str(
+            r#"{"bpm": 9000, "drums": [], "scenes": [{"bars": 99, "sounds": []}], "arrangement": [0, 42, 1]}"#,
+        )
+        .unwrap();
         song.sanitize();
         assert_eq!(song.bpm, 220.0);
-        assert_eq!(song.bars, MAX_BARS);
         assert_eq!(song.drums.len(), DRUMS);
-        assert_eq!(song.drums[0].steps.len(), MAX_STEPS);
+        assert_eq!(song.scenes.len(), SCENES);
+        assert_eq!(song.scenes[0].bars, MAX_BARS);
+        assert_eq!(song.scenes[0].drums[0].len(), MAX_STEPS);
+        assert_eq!(song.scenes[0].sounds[0].preset, Preset::Bass);
+        assert_eq!(song.arrangement, vec![0, 1]);
+    }
+
+    #[test]
+    fn every_preset_has_a_home_octave() {
+        for p in Preset::ALL {
+            assert!((1..=6).contains(&p.octave()), "{p:?}");
+            assert!(!p.hint().is_empty());
+        }
     }
 }

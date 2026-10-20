@@ -10,7 +10,7 @@ use cpal::{
 };
 use crossbeam_channel::{Receiver, Sender, bounded};
 
-use crate::drums::make_kit;
+use crate::drums::all_kits;
 use crate::engine::{Cmd, Engine, Event, Shared};
 use crate::song::Song;
 
@@ -62,7 +62,7 @@ impl Audio {
         let engine = Engine::new(
             sample_rate as f32,
             Box::new(song.clone()),
-            make_kit(song.kit, sample_rate as f32),
+            all_kits(sample_rate as f32),
             shared.clone(),
             Some(cmd_rx),
             Some(ev_tx),

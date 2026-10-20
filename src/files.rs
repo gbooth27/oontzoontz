@@ -3,7 +3,6 @@
 use std::path::Path;
 use std::sync::Arc;
 
-use crate::drums::make_kit;
 use crate::engine::Engine;
 use crate::song::{Clip, Song};
 
@@ -12,12 +11,31 @@ const EXPORT_RATE: u32 = 44_100;
 const TAIL_SECONDS: f32 = 2.5;
 const MAX_IMPORT_SECONDS: f32 = 10.0;
 
-/// The song played `loops` times, as interleaved stereo.
-pub fn render(song: &Song, rate: u32, loops: usize) -> Vec<f32> {
+/// What to put in the WAV.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Export {
+    /// The whole song row, once.
+    Song,
+    /// One scene, looped.
+    Scene { scene: usize, loops: usize },
+}
+
+/// Render to interleaved stereo.
+pub fn render(song: &Song, rate: u32, what: Export) -> Vec<f32> {
     let sr = rate as f32;
-    let mut engine = Engine::offline(sr, song.clone(), make_kit(song.kit, sr), loops);
-    engine.play();
-    let max_frames = (song.loop_seconds() * sr * (loops as f32 + 1.0)) as usize;
+    let mut engine = Engine::offline(sr, song.clone());
+    let seconds = match what {
+        Export::Song => {
+            engine.play_song();
+            song.song_seconds()
+        }
+        Export::Scene { scene, loops } => {
+            engine.set_loop_limit(Some(loops.max(1)));
+            engine.play_scene(scene);
+            song.scene_seconds(scene) * loops.max(1) as f32
+        }
+    };
+    let max_frames = ((seconds + 1.0) * sr) as usize;
     let tail = (TAIL_SECONDS * sr) as usize;
     let mut out = Vec::with_capacity((max_frames + tail) * 2);
     let mut frames = 0;
@@ -34,8 +52,8 @@ pub fn render(song: &Song, rate: u32, loops: usize) -> Vec<f32> {
     out
 }
 
-pub fn export_wav(song: &Song, loops: usize, path: &Path) -> Result<(), String> {
-    let samples = render(song, EXPORT_RATE, loops);
+pub fn export_wav(song: &Song, what: Export, path: &Path) -> Result<(), String> {
+    let samples = render(song, EXPORT_RATE, what);
     let spec = hound::WavSpec {
         channels: 2,
         sample_rate: EXPORT_RATE,
@@ -90,20 +108,36 @@ pub fn load_wav(path: &Path) -> Result<Clip, String> {
 mod tests {
     use super::*;
 
-    #[test]
-    fn export_then_import_round_trip() {
+    fn temp_wav(name: &str) -> std::path::PathBuf {
         let dir = std::env::temp_dir().join(format!("oontz-test-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("song.wav");
-        let song = Song::starter();
-        export_wav(&song, 2, &path).unwrap();
+        dir.join(name)
+    }
 
+    #[test]
+    fn export_scene_then_import_round_trip() {
+        let path = temp_wav("scene.wav");
+        let song = Song::starter();
+        export_wav(&song, Export::Scene { scene: 0, loops: 2 }, &path).unwrap();
         let clip = load_wav(&path).unwrap();
         assert_eq!(clip.rate, EXPORT_RATE);
         let seconds = clip.data.len() as f32 / EXPORT_RATE as f32;
-        let expected = (song.loop_seconds() * 2.0 + TAIL_SECONDS).min(MAX_IMPORT_SECONDS);
+        let expected = (song.scene_seconds(0) * 2.0 + TAIL_SECONDS).min(MAX_IMPORT_SECONDS);
         assert!((seconds - expected).abs() < 0.01, "{seconds} vs {expected}");
         assert!(clip.data.iter().any(|s| s.abs() > 0.1));
-        std::fs::remove_dir_all(&dir).unwrap();
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    #[test]
+    fn export_song_plays_the_whole_row() {
+        let mut song = Song::starter();
+        song.scenes[1] = song.scenes[0].clone();
+        song.arrangement = vec![0, 1, 0];
+        let frames = render(&song, 8_000, Export::Song).len() / 2;
+        let expected = (song.song_seconds() + TAIL_SECONDS) * 8_000.0;
+        assert!(
+            (frames as f32 - expected).abs() < 4.0,
+            "{frames} vs {expected}"
+        );
     }
 }

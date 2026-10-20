@@ -1,7 +1,7 @@
 # OontzOontz
 
-Grug-simple music maker. Make a beat, add a bassline, sing on top. No menus, no
-plugins, no manual.
+Grug-simple music maker. Make a beat, add a bassline, sing on top, chain it
+into a song. No menus, no plugins, no manual.
 
 ## Run it
 
@@ -13,19 +13,51 @@ cargo run --release
 
 ## How to use
 
-1. Press **PLAY** (or the space bar). A beat is already there.
+1. Press **▶ PLAY** (or the space bar). A beat is already there.
 2. **Drums:** click squares to turn hits on and off. Drag to paint lots at once.
    Click a drum's name to hear it. **🎲 Surprise me** makes up a beat.
-3. **Synths:** pick **Bass**, **Lead** or **Pad**. Click the grid to add a note,
-   drag right to make it longer, click a note to remove it. Every row is in the
-   **Key** and **Mood** you picked, so nothing sounds wrong.
+3. **Synths:** pick **Bass**, **Lead** or **Pad**, then pick a **Sound**. Click
+   the grid to add a note, drag right to make it longer, click a note to remove
+   it. Every row is in the **Key** and **Mood** you picked, so nothing sounds
+   wrong. **Arp** plays chords one note at a time; **Pump** ducks on the beat
+   like French house.
 4. **Voice:** press **🔴 Record**. You hear four clicks, then the loop plays and
    your mic records exactly one loop, then stops by itself. Headphones help.
-5. **💾 Save** keeps everything (voice too) in one `.oontz` file.
-   **⬇ Export WAV** makes a file you can share.
+5. **Scenes:** each of **A–H** is one section (verse, chorus, drop…) with its
+   own beat, notes, takes, length, drum kit and synth sounds. Click a scene to
+   edit it; if music is playing it switches when the current loop ends.
+   **⧉ Duplicate** copies a scene so you can change it up.
+6. **Song:** pick a scene and press **➕ Add** to put it in the song row. Click
+   a block in the row to take it out. **▶ SONG** plays the row from the start.
+7. **💾 Save** keeps everything (voice too) in one `.oontz` file.
+   **⬇ Export** makes a WAV of the song row (or of the current loop if the row
+   is empty).
 
-Loop length can be 1, 2 or 4 bars. Making it longer copies what you have so
-the music keeps going.
+## Sounds
+
+Drum kits: 808, Punch, Bit. Synth sounds:
+
+| Leads, keys & chords | Basses |
+| --- | --- |
+| Pluck, Beep, Big Lead, Supersaw, Soft Pad, Strings, Choir, Organ, Bell, Dusty Keys, Talkbox, Disco Stab | Acid Bass, Sub Bass, 808 Bass, Squelch, Reese, Wobble, Growl |
+
+Some of these aim at a particular sound. Wobble and Growl are dubstep-style
+basses. Talkbox, Squelch and Disco Stab with Pump go for French house. Acid
+Bass and the cowbell go for dance-punk. Dusty Keys with the **Dust** knob is an
+old-record sound.
+
+## Keyboard
+
+| Keys | Does |
+| --- | --- |
+| Space / ⇧ Space | Play or stop the scene / the song |
+| 1 – 8 | Pick scene A – H |
+| ⌘Z / ⌘⇧Z (Ctrl+Z / Ctrl+Y) | Undo / redo |
+| ⌘C ⌘X ⌘V | Copy, cut, paste a scene |
+| ⌘D | Duplicate scene |
+| ⌘S / ⌘⇧S / ⌘O / ⌘N / ⌘E | Save / save as / open / new / export |
+
+The **⌨ Keys** button in the app lists them too.
 
 ## Microphone on macOS
 
@@ -46,14 +78,15 @@ filtered to the CC0 license.
 
 | File | What it does |
 | --- | --- |
-| `src/song.rs` | The song data, scales, save/load, dice rolls |
-| `src/engine.rs` | Real-time sequencer and mixer; synced mic recording |
-| `src/synth.rs` | Polyphonic synth and its presets |
+| `src/song.rs` | Song, scenes, scales, sound list, save/load, dice rolls |
+| `src/engine.rs` | Real-time sequencer and mixer: scenes, song mode, pump, arp, dust, synced mic recording |
+| `src/synth.rs` | Polyphonic synth: unison stacks, vowel filter, drive, wobble, glide, presets |
 | `src/drums.rs` | Drum kits made from math |
+| `src/history.rs` | Undo and redo |
 | `src/dsp.rs` | Filters and small sound helpers |
 | `src/audio.rs` | Speaker and mic streams (cpal) |
 | `src/files.rs` | WAV import and export |
 | `src/app.rs` | The window (egui) |
 
-`cargo test` checks the engine, synth, drums, file round trips and the
-recording path.
+`cargo test` checks the engine, scenes and song mode, synth presets, drums,
+undo, file round trips and the recording path.

@@ -6,6 +6,7 @@ mod drums;
 mod dsp;
 mod engine;
 mod files;
+mod history;
 mod song;
 mod synth;
 

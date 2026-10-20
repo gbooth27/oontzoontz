@@ -52,6 +52,11 @@ const PUNCH: Recipe = Recipe {
     tom_lo: 120.0,
 };
 
+/// Every kit, indexed by [`Kit::index`].
+pub fn all_kits(sr: f32) -> Vec<Vec<Arc<Vec<f32>>>> {
+    Kit::ALL.iter().map(|&kit| make_kit(kit, sr)).collect()
+}
+
 /// All eight drum sounds for a kit, in `DRUM_NAMES` order, at sample rate `sr`.
 pub fn make_kit(kit: Kit, sr: f32) -> Vec<Arc<Vec<f32>>> {
     let r = if kit == Kit::Boom { &BOOM } else { &PUNCH };
