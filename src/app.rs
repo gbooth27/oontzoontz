@@ -19,7 +19,7 @@ use crate::history::History;
 use crate::song::{
     Clip, DRUM_NAMES, DRUMS, Kit, MAX_ARRANGEMENT, MIN_PART_SECONDS, Mood, NOTE_NAMES, Preset,
     SCENE_NAMES, SCENES, SLICE_CHOICES, STEPS_PER_BAR, SYNTH_NAMES, SYNTHS, Scene, Song, Sound,
-    Take, VOICE_LANES, note_name,
+    Take, VOICE_LANES, is_black_key, note_name,
 };
 
 /// Width of the controls left of every grid, so all the grids line up.
@@ -39,6 +39,7 @@ const BACKGROUND: Color32 = Color32::from_rgb(20, 21, 26);
 const PANEL: Color32 = Color32::from_rgb(30, 31, 38);
 const CELL_A: Color32 = Color32::from_rgb(52, 54, 64);
 const CELL_B: Color32 = Color32::from_rgb(42, 44, 52);
+const BLACK_KEY: Color32 = Color32::from_rgb(26, 27, 32);
 const CELL_NOW: Color32 = Color32::from_rgb(92, 94, 112);
 const DIM_TEXT: Color32 = Color32::from_gray(150);
 
@@ -872,11 +873,16 @@ impl OontzApp {
                 .show_ui(ui, |ui| {
                     for mood in Mood::ALL {
                         let label = format!("{}  ·  {}", mood.name(), mood.scale_name());
-                        ui.selectable_value(&mut self.song.mood, mood, label);
+                        if ui.selectable_label(self.song.mood == mood, label).clicked() {
+                            self.song.set_mood(mood);
+                        }
                     }
                 })
                 .response
-                .on_hover_text("Every note in the grid fits this mood, so nothing sounds wrong");
+                .on_hover_text(
+                    "Every note in the grid fits this mood, so nothing sounds wrong. \
+                     All notes gives you every piano key.",
+                );
         });
         group(ui, "SCENE LENGTH", |ui| {
             let scene = &mut self.song.scenes[self.scene];
@@ -1437,12 +1443,15 @@ impl OontzApp {
                 vec2(72.0, NOTE_ROW_H),
             )
             .shrink2(vec2(0.0, 1.0));
+            let midi = self.song.midi(self.scene, t, row);
             let root = self.song.mood.is_root(row);
             let hot = hovered == Some(vis);
             let fill = if hot {
                 color
             } else if root {
                 mix(color, CELL_B, 0.45)
+            } else if is_black_key(midi) {
+                BLACK_KEY
             } else {
                 CELL_A
             };
@@ -1455,7 +1464,7 @@ impl OontzApp {
             painter.text(
                 key.left_center() + vec2(8.0, 0.0),
                 Align2::LEFT_CENTER,
-                note_name(self.song.midi(self.scene, t, row)),
+                note_name(midi),
                 FontId::proportional(12.0),
                 text,
             );
@@ -1485,11 +1494,15 @@ impl OontzApp {
         let painter = ui.painter_at(rect);
         let color = SYNTH_COLORS[t];
         for vis in 0..rows {
-            let root = self.song.mood.is_root(rows - 1 - vis);
+            let row = rows - 1 - vis;
+            let root = self.song.mood.is_root(row);
+            let black = is_black_key(self.song.midi(self.scene, t, row));
             for s in 0..steps {
                 let mut fill = empty_cell(s, playhead);
                 if root {
                     fill = mix(fill, color, 0.12);
+                } else if black {
+                    fill = mix(fill, Color32::BLACK, 0.25);
                 }
                 painter.rect_filled(cell_rect(rect, s, vis, cw, NOTE_ROW_H).shrink(1.0), 3, fill);
             }

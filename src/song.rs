@@ -16,8 +16,8 @@ use crate::dsp::Rng;
 pub const STEPS_PER_BAR: usize = 16;
 pub const MAX_BARS: usize = 4;
 pub const MAX_STEPS: usize = STEPS_PER_BAR * MAX_BARS;
-/// Most note rows any mood needs: 7-note scale, two octaves, plus the top root.
-pub const MAX_ROWS: usize = 15;
+/// Most note rows any mood needs: all 12 notes, two octaves, plus the top root.
+pub const MAX_ROWS: usize = 25;
 pub const DRUMS: usize = 8;
 pub const SYNTHS: usize = 3;
 pub const SYNTH_NAMES: [&str; SYNTHS] = ["Bass", "Lead", "Pad"];
@@ -60,12 +60,17 @@ pub fn note_name(midi: i32) -> String {
     )
 }
 
+/// Sharps and flats: the black keys on a piano.
+pub fn is_black_key(midi: i32) -> bool {
+    NOTE_NAMES[midi.rem_euclid(12) as usize].ends_with('#')
+}
+
 pub fn midi_to_freq(midi: i32) -> f32 {
     440.0 * 2f32.powf((midi - 69) as f32 / 12.0)
 }
 
 /// A scale, named by how it feels. Every note in the grid is in the scale,
-/// so nothing can sound "wrong".
+/// so nothing can sound "wrong". All notes is the exception: every piano key.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Mood {
     Happy,
@@ -74,16 +79,18 @@ pub enum Mood {
     Sunny,
     Spooky,
     Dreamy,
+    Chromatic,
 }
 
 impl Mood {
-    pub const ALL: [Mood; 6] = [
+    pub const ALL: [Mood; 7] = [
         Mood::Happy,
         Mood::Sad,
         Mood::Chill,
         Mood::Sunny,
         Mood::Spooky,
         Mood::Dreamy,
+        Mood::Chromatic,
     ];
 
     pub fn name(self) -> &'static str {
@@ -94,6 +101,7 @@ impl Mood {
             Mood::Sunny => "Sunny",
             Mood::Spooky => "Spooky",
             Mood::Dreamy => "Dreamy",
+            Mood::Chromatic => "All notes",
         }
     }
 
@@ -106,6 +114,7 @@ impl Mood {
             Mood::Sunny => "major pentatonic",
             Mood::Spooky => "phrygian dominant",
             Mood::Dreamy => "lydian",
+            Mood::Chromatic => "chromatic, some will clash",
         }
     }
 
@@ -117,6 +126,7 @@ impl Mood {
             Mood::Sunny => &[0, 2, 4, 7, 9],
             Mood::Spooky => &[0, 1, 4, 5, 7, 8, 10],
             Mood::Dreamy => &[0, 2, 4, 6, 7, 9, 11],
+            Mood::Chromatic => &[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11],
         }
     }
 
@@ -134,6 +144,22 @@ impl Mood {
     pub fn semitone(self, row: usize) -> i32 {
         let iv = self.intervals();
         (row / iv.len()) as i32 * 12 + iv[row % iv.len()]
+    }
+
+    /// The row closest to `semitone` above the root. Ties go to the lower row.
+    pub fn nearest_row(self, semitone: i32) -> usize {
+        (0..self.rows())
+            .min_by_key(|&r| (self.semitone(r) - semitone).abs())
+            .unwrap_or(0)
+    }
+
+    /// The scale "Surprise me" makes parts in. Random notes from all twelve
+    /// would just sound wrong.
+    fn dice_mood(self) -> Mood {
+        match self {
+            Mood::Chromatic => Mood::Sad,
+            m => m,
+        }
     }
 
     pub fn is_root(self, row: usize) -> bool {
@@ -786,9 +812,10 @@ impl Scene {
     /// track 1 a melody, track 2 chords.
     pub fn random_notes(&mut self, track: usize, mood: Mood, rng: &mut Rng) {
         const PHRASE: usize = STEPS_PER_BAR * 2;
-        let n = mood.degrees();
-        let rows = mood.rows();
-        let fifth = mood.fifth_row();
+        let scale = mood.dice_mood();
+        let n = scale.degrees();
+        let rows = scale.rows();
+        let fifth = scale.fifth_row();
         let mut pat = vec![[0u8; PHRASE]; MAX_ROWS];
         match track {
             0 => {
@@ -845,15 +872,41 @@ impl Scene {
                 }
             }
         }
-        let steps = self.steps();
-        let notes = &mut self.notes[track];
-        for (row, pat_row) in notes.iter_mut().zip(&pat) {
+        // Put each note on its own pitch's row in the song's mood.
+        let mut by_row = vec![[0u8; PHRASE]; MAX_ROWS];
+        for (r, pat_row) in pat.iter().enumerate().take(rows) {
+            by_row[mood.nearest_row(scale.semitone(r))] = *pat_row;
+        }
+        for (row, pat_row) in self.notes[track].iter_mut().zip(&by_row) {
             for (s, len) in row.iter_mut().enumerate() {
                 *len = pat_row[s % PHRASE];
             }
         }
         // Tiling can make a long note run into the next one or past the loop end.
-        for row in notes.iter_mut() {
+        self.trim_notes(track);
+    }
+
+    /// Move every note from `from`'s rows to the row with the same pitch in
+    /// `to`, or the closest one when `to` doesn't have it.
+    pub fn change_mood(&mut self, from: Mood, to: Mood) {
+        for t in 0..SYNTHS {
+            let mut moved = vec![vec![0u8; MAX_STEPS]; MAX_ROWS];
+            for (row, notes) in self.notes[t].iter().enumerate().take(from.rows()) {
+                let dest = &mut moved[to.nearest_row(from.semitone(row))];
+                for (len, &old) in dest.iter_mut().zip(notes) {
+                    *len = (*len).max(old);
+                }
+            }
+            self.notes[t] = moved;
+            // Two notes can land on one row now.
+            self.trim_notes(t);
+        }
+    }
+
+    /// Shorten notes so none runs into the next one on its row or past the loop end.
+    fn trim_notes(&mut self, track: usize) {
+        let steps = self.steps();
+        for row in self.notes[track].iter_mut() {
             for s in 0..MAX_STEPS {
                 if row[s] > 0 {
                     let next = (s + 1..MAX_STEPS)
@@ -1013,6 +1066,17 @@ impl Song {
             .iter()
             .map(|&s| self.scene_seconds(s))
             .sum()
+    }
+
+    /// Change the scale for every scene, keeping notes at their pitch.
+    pub fn set_mood(&mut self, mood: Mood) {
+        if mood == self.mood {
+            return;
+        }
+        for scene in &mut self.scenes {
+            scene.change_mood(self.mood, mood);
+        }
+        self.mood = mood;
     }
 
     pub fn midi(&self, scene: usize, track: usize, row: usize) -> i32 {
@@ -1196,6 +1260,100 @@ mod tests {
     }
 
     #[test]
+    fn all_notes_mood_has_every_piano_key() {
+        let song = Song {
+            root: 0,
+            mood: Mood::Chromatic,
+            ..Song::default()
+        };
+        assert_eq!(song.mood.rows(), 25);
+        let names: Vec<String> = (0..13).map(|r| note_name(song.midi(0, 1, r))).collect();
+        assert_eq!(
+            names,
+            [
+                "C4", "C#4", "D4", "D#4", "E4", "F4", "F#4", "G4", "G#4", "A4", "A#4", "B4", "C5"
+            ]
+        );
+        assert_eq!(song.mood.semitone(24), 24);
+        let black: Vec<bool> = (60..72).map(is_black_key).collect();
+        assert_eq!(
+            black,
+            [
+                false, true, false, true, false, false, true, false, true, false, true, false
+            ]
+        );
+    }
+
+    /// Every note in scene 0 as (synth, step, length, pitch).
+    fn sounding(song: &Song) -> Vec<(usize, usize, u8, i32)> {
+        let mut out = Vec::new();
+        for t in 0..SYNTHS {
+            for row in 0..song.mood.rows() {
+                for s in 0..MAX_STEPS {
+                    let len = song.scenes[0].notes[t][row][s];
+                    if len > 0 {
+                        out.push((t, s, len, song.midi(0, t, row)));
+                    }
+                }
+            }
+        }
+        out.sort();
+        out
+    }
+
+    #[test]
+    fn changing_mood_keeps_notes_at_their_pitch() {
+        let mut song = Song::starter();
+        song.scenes[0].random_notes(1, song.mood, &mut Rng::new(5));
+        let notes = song.scenes[0].notes.clone();
+        let before = sounding(&song);
+        assert!(before.len() > 4);
+        song.set_mood(Mood::Chromatic);
+        assert_eq!(sounding(&song), before);
+        song.set_mood(Mood::Chill);
+        assert_eq!(song.scenes[0].notes, notes);
+
+        // A note the new scale doesn't have moves to the closest one it does,
+        // and gets cut short where it now runs into its neighbour.
+        let mut song = Song {
+            root: 0,
+            mood: Mood::Chromatic,
+            ..Song::default()
+        };
+        let bass = &mut song.scenes[0].notes[0];
+        bass[0][0] = 4; // C
+        bass[1][2] = 1; // C#: Chill has no C#, C is closest
+        bass[11][0] = 2; // B: closest is A# (Bb)
+        song.set_mood(Mood::Chill);
+        let bass = &song.scenes[0].notes[0];
+        assert_eq!((bass[0][0], bass[0][2]), (2, 1));
+        assert_eq!(bass[4][0], 2);
+        assert_eq!(sounding(&song).len(), 3);
+    }
+
+    #[test]
+    fn surprise_parts_in_all_notes_stay_in_a_scale() {
+        let mut rng = Rng::new(3);
+        let mut scene = Scene::default();
+        for t in 0..SYNTHS {
+            for _ in 0..20 {
+                scene.random_notes(t, Mood::Chromatic, &mut rng);
+                let used: Vec<usize> = (0..MAX_ROWS)
+                    .filter(|&row| scene.notes[t][row].iter().any(|&len| len > 0))
+                    .collect();
+                assert!(!used.is_empty());
+                for row in used {
+                    let semitone = (row % 12) as i32;
+                    assert!(
+                        Mood::Sad.intervals().contains(&semitone),
+                        "synth {t} played semitone {semitone}, not in the minor scale"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
     fn growing_the_loop_copies_the_beat() {
         let mut song = Song::starter();
         let scene = &mut song.scenes[0];
@@ -1236,7 +1394,7 @@ mod tests {
         let mut rng = Rng::new(7);
         for bars in [1, 2, 4] {
             for _ in 0..50 {
-                let mood = Mood::ALL[rng.range(0, 5) as usize];
+                let mood = Mood::ALL[rng.range(0, Mood::ALL.len() as i32 - 1) as usize];
                 let mut scene = Scene::default();
                 scene.set_bars(bars);
                 scene.random_beat(&mut rng);

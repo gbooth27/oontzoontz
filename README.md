@@ -19,8 +19,10 @@ cargo run --release
 3. **Synths:** pick **Bass**, **Lead** or **Pad**, then pick a **Sound**. Click
    the grid to add a note, drag right to make it longer, click a note to remove
    it. Every row is in the **Key** and **Mood** you picked, so nothing sounds
-   wrong. **Arp** plays chords one note at a time; **Pump** ducks on the beat
-   like French house.
+   wrong. Want every piano key (sharps and flats too)? Pick the **All notes**
+   mood. Changing mood keeps your notes where they are, or moves each one to
+   the closest note the new mood has. **Arp** plays chords one note at a time;
+   **Pump** ducks on the beat like French house.
 4. **Chop:** press **📂 Load WAV** and pick any sound file (a drum break, an old
    record…). Drag across the waveform to pick the part you want, and it gets
    cut into 4, 8 or 16 slices. Click the grid to play the slices in any order.
