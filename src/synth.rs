@@ -51,6 +51,12 @@ pub struct Patch {
     pub lfo_rate: f32,
     /// How many octaves the wobble moves the filter.
     pub lfo_oct: f32,
+    /// The wobble only rises, then snaps back and starts again, instead of
+    /// going smoothly up and down.
+    pub lfo_ramp: bool,
+    /// How far behind the left side the right side's wobble runs, in wobbles.
+    /// Above 0 the sound swirls between the speakers.
+    pub lfo_spread: f32,
     pub vowel: Option<Vowel>,
     /// 0 = clean, 1 = smashed.
     pub drive: f32,
@@ -62,6 +68,22 @@ pub struct Patch {
     /// Seconds to slide between notes. Anything above 0 makes the sound mono.
     pub glide: f32,
     pub gain: f32,
+}
+
+impl Patch {
+    /// The wobble, 0.0 to 1.0, at `phase` wobbles in.
+    pub fn lfo(&self, phase: f32) -> f32 {
+        /// Part of each ramp spent falling back, so the filter doesn't click.
+        const FALL: f32 = 0.1;
+        let phase = phase.rem_euclid(1.0);
+        if !self.lfo_ramp {
+            0.5 - 0.5 * (TAU * phase).cos()
+        } else if phase < 1.0 - FALL {
+            phase / (1.0 - FALL)
+        } else {
+            (1.0 - phase) / FALL
+        }
+    }
 }
 
 pub fn patch(preset: Preset) -> Patch {
@@ -80,6 +102,8 @@ pub fn patch(preset: Preset) -> Patch {
         q: 0.7,
         lfo_rate: 0.0,
         lfo_oct: 0.0,
+        lfo_ramp: false,
+        lfo_spread: 0.0,
         vowel: None,
         drive: 0.0,
         vibrato: 0.0,
@@ -257,6 +281,29 @@ pub fn patch(preset: Preset) -> Patch {
             lfo_rate: 0.25,
             lfo_oct: 2.0,
             gain: 0.35,
+            ..base
+        },
+        // Resonant filter that keeps sweeping up and starting over, a little
+        // later on the right than the left, so the riff twists between the
+        // speakers. Mono with glide, so the notes slur into each other.
+        Preset::Corkscrew => Patch {
+            unison: 3,
+            detune: 14.0,
+            sub: 0.25,
+            decay: 0.3,
+            sustain: 0.8,
+            release: 0.1,
+            cutoff: 450.0,
+            env_oct: 1.0,
+            env_decay: 0.08,
+            q: 5.0,
+            lfo_rate: 0.5,
+            lfo_oct: 3.5,
+            lfo_ramp: true,
+            lfo_spread: 0.12,
+            drive: 0.35,
+            glide: 0.03,
+            gain: 0.45,
             ..base
         },
         Preset::Bass => Patch {
@@ -468,7 +515,9 @@ impl Voice {
         }
     }
 
-    fn render(&mut self, p: &Patch, stack: &Stack, bright: f32, lfo: f32, sr: f32) -> (f32, f32) {
+    fn render(&mut self, p: &Patch, stack: &Stack, bright: f32, phase: f32, sr: f32) -> (f32, f32) {
+        let lfo = p.lfo(phase);
+        let lfo_r = p.lfo(phase - p.lfo_spread);
         if !self.on {
             return (0.0, 0.0);
         }
@@ -563,10 +612,11 @@ impl Voice {
             r = drive(r, p.drive);
         }
         if p.cutoff < 19_000.0 || p.env_oct > 0.0 || p.lfo_oct > 0.0 {
-            let octaves = (bright - 0.5) * 4.0 + p.env_oct * env + p.lfo_oct * lfo;
-            let cutoff = p.cutoff * octaves.exp2();
-            l = self.filt_l.lowpass(l, cutoff, p.q, sr);
-            r = self.filt_r.lowpass(r, cutoff, p.q, sr);
+            let octaves = (bright - 0.5) * 4.0 + p.env_oct * env;
+            let cutoff_l = p.cutoff * (octaves + p.lfo_oct * lfo).exp2();
+            let cutoff_r = p.cutoff * (octaves + p.lfo_oct * lfo_r).exp2();
+            l = self.filt_l.lowpass(l, cutoff_l, p.q, sr);
+            r = self.filt_r.lowpass(r, cutoff_r, p.q, sr);
         }
         self.t += dt;
         let g = self.level * p.gain;
@@ -619,8 +669,9 @@ impl Synth {
         }
     }
 
-    /// `lfo` is the wobble position, 0.0 to 1.0, kept in time by the engine.
-    pub fn render(&mut self, p: &Patch, bright: f32, lfo: f32, sr: f32) -> (f32, f32) {
+    /// `phase` is how far into the current wobble we are (0.0 to 1.0), kept in
+    /// time with the beat by the engine.
+    pub fn render(&mut self, p: &Patch, bright: f32, phase: f32, sr: f32) -> (f32, f32) {
         if !self.voices.iter().any(|v| v.on) {
             return (0.0, 0.0);
         }
@@ -629,7 +680,7 @@ impl Synth {
         }
         let stack = self.stack;
         self.voices.iter_mut().fold((0.0, 0.0), |(l, r), v| {
-            let (a, b) = v.render(p, &stack, bright, lfo, sr);
+            let (a, b) = v.render(p, &stack, bright, phase, sr);
             (l + a, r + b)
         })
     }
@@ -649,8 +700,7 @@ mod tests {
             synth.note_on(110.0, (SR * 0.25) as u32, &p);
             let mut loudest = 0.0f32;
             for i in 0..(SR * 0.5) as usize {
-                let lfo = 0.5 - 0.5 * (i as f32 / SR * TAU).cos();
-                let (l, r) = synth.render(&p, 0.5, lfo, SR);
+                let (l, r) = synth.render(&p, 0.5, i as f32 / SR, SR);
                 assert!(l.is_finite() && r.is_finite(), "{preset:?}");
                 loudest = loudest.max(l.abs()).max(r.abs());
             }
@@ -664,6 +714,72 @@ mod tests {
                 "{preset:?} never stopped"
             );
         }
+    }
+
+    #[test]
+    fn wobble_shapes() {
+        let smooth = patch(Preset::Wobble);
+        for (phase, want) in [(0.0, 0.0), (0.25, 0.5), (0.5, 1.0), (1.0, 0.0)] {
+            assert!((smooth.lfo(phase) - want).abs() < 1e-5, "{phase}");
+        }
+        let ramp = patch(Preset::Corkscrew);
+        for (phase, want) in [(0.0, 0.0), (0.45, 0.5), (0.9, 1.0), (0.95, 0.5), (1.0, 0.0)] {
+            assert!((ramp.lfo(phase) - want).abs() < 1e-5, "{phase}");
+        }
+        assert_eq!(ramp.lfo(-0.1), ramp.lfo(0.9));
+    }
+
+    /// How bright each side is in each slice of one wobble: how much the
+    /// signal moves from sample to sample, against how loud it is.
+    fn brightness(p: &Patch, slices: usize) -> Vec<(f32, f32)> {
+        let wobble = SR / 2.0; // half a second per wobble
+        let mut synth = Synth::default();
+        synth.note_on(110.0, (SR * 3.0) as u32, p);
+        // Let the note's start settle, then measure the second wobble.
+        for i in 0..wobble as usize {
+            synth.render(p, 0.5, i as f32 / wobble, SR);
+        }
+        let len = wobble as usize / slices;
+        let mut prev = (0.0, 0.0);
+        (0..slices)
+            .map(|k| {
+                let (mut diff, mut level) = ((0.0, 0.0), (0.0, 0.0));
+                for i in 0..len {
+                    let phase = (k * len + i) as f32 / wobble;
+                    let (l, r) = synth.render(p, 0.5, phase, SR);
+                    diff.0 += (l - prev.0) * (l - prev.0);
+                    diff.1 += (r - prev.1) * (r - prev.1);
+                    level.0 += l * l;
+                    level.1 += r * r;
+                    prev = (l, r);
+                }
+                ((diff.0 / level.0).sqrt(), (diff.1 / level.1).sqrt())
+            })
+            .collect()
+    }
+
+    #[test]
+    fn corkscrew_sweeps_up_snaps_back_and_twists_left_to_right() {
+        let p = patch(Preset::Corkscrew);
+        let b = brightness(&p, 20);
+        let left: Vec<f32> = b.iter().map(|s| s.0).collect();
+        // Climbs through the wobble (in steps: the peak lights up one
+        // harmonic after another)…
+        assert!(left[17] > left[1] * 2.0, "{left:?}");
+        let quarters: Vec<f32> = left[2..18].chunks(4).map(|q| q.iter().sum()).collect();
+        assert!(quarters.windows(2).all(|w| w[1] > w[0]), "{left:?}");
+        // …then drops back down at the end.
+        assert!(left[19] < left[17] * 0.8, "{left:?}");
+        // The right side is the same sweep, a bit behind: shifting it back
+        // by the spread lines it up with the left best.
+        let mismatch =
+            |lag: usize| -> f32 { (6..18).map(|k| (b[k].1 - left[k - lag]).powi(2)).sum() };
+        let best = (0..6).min_by(|&x, &y| mismatch(x).total_cmp(&mismatch(y)));
+        let want = p.lfo_spread * 20.0;
+        assert!(
+            best.is_some_and(|lag| lag >= 2 && (lag as f32 - want).abs() <= 1.0),
+            "right best matches left {best:?} slices earlier, wanted about {want}"
+        );
     }
 
     #[test]

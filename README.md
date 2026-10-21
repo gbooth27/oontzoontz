@@ -12,8 +12,9 @@ cargo run --release
 ```
 
 Name a song file to open it straight away. `songs/dance-punk.oontz` is a
-demo: eight scenes of dance-punk (cowbell, pulsing acid bass, one buzzy riff
-whose filter opens up as the song goes on). Press **▶ SONG** to hear it all.
+demo: eight scenes of dance-punk (cowbell, pulsing acid bass, and a
+Corkscrew riff that twists round and round and gets brighter as the song
+goes on). Press **▶ SONG** to hear it all.
 
 ```sh
 cargo run --release -- songs/dance-punk.oontz
@@ -56,11 +57,13 @@ Drum kits: 808, Punch, Bit. Synth sounds:
 
 | Leads, keys & chords | Basses |
 | --- | --- |
-| Pluck, Beep, Big Lead, Supersaw, Soft Pad, Strings, Choir, Organ, Bell, Dusty Keys, Talkbox, Disco Stab | Acid Bass, Sub Bass, 808 Bass, Squelch, Reese, Wobble, Growl |
+| Pluck, Beep, Big Lead, Supersaw, Soft Pad, Strings, Choir, Organ, Bell, Dusty Keys, Talkbox, Disco Stab, Corkscrew | Acid Bass, Sub Bass, 808 Bass, Squelch, Reese, Wobble, Growl |
 
 Some of these aim at a particular sound. Wobble and Growl are dubstep-style
 basses. Talkbox, Squelch and Disco Stab with Pump go for French house. Acid
-Bass and the cowbell go for dance-punk. Dusty Keys and the chop track with the
+Bass, Corkscrew and the cowbell go for dance-punk: Corkscrew's filter sweeps
+up and snaps back every two beats, a little later on the right than the
+left, so a riff on it spins between the speakers. Dusty Keys and the chop track with the
 **Dust** knob make an old-record collage sound.
 
 ## Keyboard

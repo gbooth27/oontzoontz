@@ -209,6 +209,7 @@ pub enum Preset {
     DustyKeys,
     Talkbox,
     Disco,
+    Corkscrew,
     Bass,
     Sub,
     Eight08,
@@ -219,7 +220,7 @@ pub enum Preset {
 }
 
 impl Preset {
-    pub const ALL: [Preset; 19] = [
+    pub const ALL: [Preset; 20] = [
         Preset::Pluck,
         Preset::Beep,
         Preset::Lead,
@@ -232,6 +233,7 @@ impl Preset {
         Preset::DustyKeys,
         Preset::Talkbox,
         Preset::Disco,
+        Preset::Corkscrew,
         Preset::Bass,
         Preset::Sub,
         Preset::Eight08,
@@ -255,6 +257,7 @@ impl Preset {
             Preset::DustyKeys => "Dusty Keys",
             Preset::Talkbox => "Talkbox",
             Preset::Disco => "Disco Stab",
+            Preset::Corkscrew => "Corkscrew",
             Preset::Bass => "Acid Bass",
             Preset::Sub => "Sub Bass",
             Preset::Eight08 => "808 Bass",
@@ -280,6 +283,7 @@ impl Preset {
             Preset::DustyKeys => "warbly old-record keys",
             Preset::Talkbox => "robot voice",
             Preset::Disco => "filtered French house chords",
+            Preset::Corkscrew => "buzzy riff that twists round and round",
             Preset::Bass => "squelchy 303 acid",
             Preset::Sub => "deep and round",
             Preset::Eight08 => "booming hip-hop / trap bass",
@@ -315,6 +319,7 @@ impl Preset {
             | Preset::DustyKeys
             | Preset::Talkbox
             | Preset::Disco
+            | Preset::Corkscrew
             | Preset::Squelch => 3,
             Preset::Pluck | Preset::Beep | Preset::Lead | Preset::Supersaw | Preset::Bell => 4,
         }

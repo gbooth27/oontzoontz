@@ -5,7 +5,6 @@
 //! engine throws away is sent back as [`Trash`] so it gets freed on the UI thread.
 
 use std::f32::consts::TAU;
-use std::f64::consts::TAU as TAU64;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering::Relaxed};
 
@@ -1020,12 +1019,8 @@ impl Engine {
         for (t, synth) in self.synths.iter_mut().enumerate() {
             let mix = &scene.synth_mix[t];
             let p = patch(scene.sounds[t].preset);
-            let lfo = if p.lfo_rate > 0.0 {
-                (0.5 - 0.5 * (TAU64 * beat * p.lfo_rate as f64).cos()) as f32
-            } else {
-                0.0
-            };
-            let (a, b) = synth.render(&p, mix.bright, lfo, sr);
+            let phase = (beat * p.lfo_rate as f64).fract() as f32;
+            let (a, b) = synth.render(&p, mix.bright, phase, sr);
             let level = &mut self.synth_level[t];
             *level += (mix.volume * mix.volume - *level) * level_glide;
             let g = *level * if mix.pump { pump } else { 1.0 };
