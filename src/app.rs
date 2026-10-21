@@ -17,9 +17,9 @@ use crate::engine::{Cmd, Event, NONE, REC_COUNT_IN, REC_IDLE, REC_RECORDING, tak
 use crate::files::{self, Export};
 use crate::history::History;
 use crate::song::{
-    Clip, DRUM_NAMES, DRUMS, Kit, MAX_ARRANGEMENT, MAX_SAMPLES, Mood, NOTE_NAMES, Preset,
-    SCENE_NAMES, SCENES, SLICE_CHOICES, STEPS_PER_BAR, SYNTH_NAMES, SYNTHS, Sample, Scene, Song,
-    Sound, Take, VOICE_LANES, note_name,
+    Clip, DRUM_NAMES, DRUMS, Kit, MAX_ARRANGEMENT, MIN_PART_SECONDS, Mood, NOTE_NAMES, Preset,
+    SCENE_NAMES, SCENES, SLICE_CHOICES, STEPS_PER_BAR, SYNTH_NAMES, SYNTHS, Scene, Song, Sound,
+    Take, VOICE_LANES, note_name,
 };
 
 /// Width of the controls left of every grid, so all the grids line up.
@@ -1701,66 +1701,28 @@ impl OontzApp {
         else {
             return;
         };
-        let clip = match files::load_wav(&path, files::SAMPLE_SECONDS) {
-            Ok(clip) if !clip.data.is_empty() => clip,
-            Ok(_) => {
-                self.status = "🤔 That WAV has no sound in it.".into();
-                return;
+        match files::load_sample(&path) {
+            Ok(sample) => {
+                let name = sample.name.clone();
+                let i = self.song.add_sample(sample);
+                self.use_sample(i);
+                let long = files::SAMPLE_SECONDS;
+                self.status = format!(
+                    "✂ \"{name}\" is cut into slices. Click the grid to play them in any order \
+                     (files longer than {long:.0} s are cut short)."
+                );
             }
-            Err(e) => {
-                self.status = format!("😕 Couldn't read that WAV: {e}");
-                return;
-            }
-        };
-        if self.song.samples.len() >= MAX_SAMPLES {
-            self.song.prune_samples();
+            Err(e) => self.status = format!("😕 Couldn't read that WAV: {e}"),
         }
-        if self.song.samples.len() >= MAX_SAMPLES {
-            self.status = format!("That's {MAX_SAMPLES} sounds already! Stop using one first.");
-            return;
-        }
-        let name = path
-            .file_stem()
-            .map_or_else(|| "sound".into(), |s| s.to_string_lossy().into_owned());
-        self.song.samples.push(Sample {
-            name: name.clone(),
-            clip,
-        });
-        self.use_sample(self.song.samples.len() - 1);
-        let long = files::SAMPLE_SECONDS;
-        self.status = format!(
-            "✂ \"{name}\" is cut into slices. Click the grid to play them in any order \
-             (files longer than {long:.0} s are cut short)."
-        );
     }
 
-    /// Chop sound `i` in this scene, starting with one loop's worth from the top.
     fn use_sample(&mut self, i: usize) {
-        let loop_secs = self.song.scene_seconds(self.scene);
-        let scene = &mut self.song.scenes[self.scene];
-        if scene.chop.sample == Some(i) {
-            return;
+        if self.song.use_sample(self.scene, i) {
+            self.outbox.push(Cmd::PreviewSlice {
+                scene: self.scene,
+                slice: 0,
+            });
         }
-        let steps = scene.steps();
-        let clip = &self.song.samples[i].clip;
-        let chop = &mut scene.chop;
-        chop.sample = Some(i);
-        chop.start = 0.0;
-        chop.length = (clip.data.len() as f32 / clip.rate as f32).min(loop_secs);
-        if !chop.has_hits(steps) {
-            chop.in_order(steps);
-        }
-        self.outbox.push(Cmd::PreviewSlice {
-            scene: self.scene,
-            slice: 0,
-        });
-    }
-
-    fn chop_file_seconds(&self) -> f32 {
-        let chop = &self.song.scenes[self.scene].chop;
-        chop.sample
-            .and_then(|i| self.song.samples.get(i))
-            .map_or(0.0, |s| s.clip.data.len() as f32 / s.clip.rate as f32)
     }
 
     fn update_chop_waves(&mut self) {
@@ -1799,7 +1761,7 @@ impl OontzApp {
 
     fn region_controls(&mut self, ui: &mut Ui) {
         let loop_secs = self.song.scene_seconds(self.scene);
-        let file_secs = self.chop_file_seconds();
+        let file_secs = self.song.chop_file_seconds(self.scene);
         let chop = &mut self.song.scenes[self.scene].chop;
         ui.label("From");
         ui.add(
@@ -1813,7 +1775,7 @@ impl OontzApp {
         ui.label("for");
         ui.add(
             egui::DragValue::new(&mut chop.length)
-                .range(0.05..=file_secs.max(0.05))
+                .range(MIN_PART_SECONDS..=file_secs.max(MIN_PART_SECONDS))
                 .speed(0.005)
                 .max_decimals(2)
                 .suffix(" s"),
@@ -1830,7 +1792,7 @@ impl OontzApp {
 
     /// The whole sound file, with the chopped part lit up. Drag to pick the part.
     fn region_strip(&mut self, ui: &mut Ui) {
-        let file_secs = self.chop_file_seconds().max(1e-3);
+        let file_secs = self.song.chop_file_seconds(self.scene).max(1e-3);
         let width = ui.available_width().max(120.0);
         let (rect, resp) = ui.allocate_exact_size(vec2(width, REGION_H), Sense::click_and_drag());
         let painter = ui.painter_at(rect);
@@ -1883,13 +1845,11 @@ impl OontzApp {
             && resp.dragged()
             && let Some(pos) = resp.interact_pointer_pos()
         {
-            let now = secs_at(pos.x);
-            chop.start = anchor.min(now);
-            chop.length = (anchor - now).abs().max(0.05);
+            chop.drag_region(anchor, secs_at(pos.x));
         } else if resp.clicked()
             && let Some(pos) = resp.interact_pointer_pos()
         {
-            chop.start = secs_at(pos.x).min((file_secs - chop.length).max(0.0));
+            chop.move_region(secs_at(pos.x), file_secs);
         }
     }
 

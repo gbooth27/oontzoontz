@@ -4,7 +4,7 @@ use std::path::Path;
 use std::sync::Arc;
 
 use crate::engine::Engine;
-use crate::song::{Clip, Song};
+use crate::song::{Clip, Sample, Song};
 
 const EXPORT_RATE: u32 = 44_100;
 /// Let echoes and long notes ring out after the last loop.
@@ -106,14 +106,190 @@ pub fn load_wav(path: &Path, max_seconds: f32) -> Result<Clip, String> {
     })
 }
 
+/// Read a WAV to chop, named after its file.
+pub fn load_sample(path: &Path) -> Result<Sample, String> {
+    let clip = load_wav(path, SAMPLE_SECONDS)?;
+    let name = path
+        .file_stem()
+        .map_or_else(|| "sound".into(), |s| s.to_string_lossy().into_owned());
+    Ok(Sample { name, clip })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::song::Take;
+    use std::f32::consts::TAU;
+
+    const RATE: u32 = 8_000;
 
     fn temp_wav(name: &str) -> std::path::PathBuf {
         let dir = std::env::temp_dir().join(format!("oontz-test-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         dir.join(name)
+    }
+
+    /// Write a 16-bit WAV with `frames` frames; `sample(frame, channel)` says what's in it.
+    fn write_wav(
+        path: &Path,
+        channels: u16,
+        rate: u32,
+        frames: usize,
+        sample: impl Fn(usize, usize) -> f32,
+    ) {
+        let spec = hound::WavSpec {
+            channels,
+            sample_rate: rate,
+            bits_per_sample: 16,
+            sample_format: hound::SampleFormat::Int,
+        };
+        let mut w = hound::WavWriter::create(path, spec).unwrap();
+        for f in 0..frames {
+            for c in 0..channels as usize {
+                w.write_sample((sample(f, c) * 32767.0) as i16).unwrap();
+            }
+        }
+        w.finalize().unwrap();
+    }
+
+    fn tone(hz: f32, seconds: f32) -> Arc<Vec<f32>> {
+        let n = (seconds * RATE as f32) as usize;
+        Arc::new(
+            (0..n)
+                .map(|i| (TAU * hz * i as f32 / RATE as f32).sin() * 0.5)
+                .collect(),
+        )
+    }
+
+    /// Loudest sample on the left channel between two frames.
+    fn loudest(out: &[f32], from: usize, to: usize) -> f32 {
+        out[from * 2..to * 2]
+            .iter()
+            .step_by(2)
+            .fold(0.0, |m, s| m.max(s.abs()))
+    }
+
+    #[test]
+    fn chop_files_keep_a_minute_and_drums_keep_ten_seconds() {
+        let path = temp_wav("my break.wav");
+        write_wav(
+            &path,
+            1,
+            1_000,
+            70_000,
+            |f, _| if f % 2 == 0 { 0.5 } else { -0.5 },
+        );
+        let sample = load_sample(&path).unwrap();
+        assert_eq!(sample.name, "my break");
+        assert_eq!(sample.clip.rate, 1_000);
+        assert_eq!(sample.clip.seconds(), SAMPLE_SECONDS);
+        let drum = load_wav(&path, DRUM_SECONDS).unwrap();
+        assert_eq!(drum.seconds(), DRUM_SECONDS);
+        // Shorter files come in whole.
+        write_wav(&path, 1, 1_000, 2_500, |_, _| 0.25);
+        assert_eq!(load_sample(&path).unwrap().clip.seconds(), 2.5);
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    #[test]
+    fn stereo_files_become_mono() {
+        let path = temp_wav("stereo.wav");
+        write_wav(&path, 2, RATE, 100, |_, c| if c == 0 { 0.5 } else { -0.1 });
+        let clip = load_wav(&path, DRUM_SECONDS).unwrap();
+        assert_eq!(clip.data.len(), 100);
+        assert!(clip.data.iter().all(|s| (s - 0.2).abs() < 1e-3));
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    #[test]
+    fn empty_and_broken_files_are_refused() {
+        let path = temp_wav("empty.wav");
+        write_wav(&path, 1, RATE, 0, |_, _| 0.0);
+        assert!(load_sample(&path).is_err());
+        std::fs::write(&path, "not a wav at all").unwrap();
+        assert!(load_sample(&path).is_err());
+        assert!(load_sample(&temp_wav("missing.wav")).is_err());
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    #[test]
+    fn export_has_the_chop_in_it() {
+        // One bar at 120 bpm is 2 s; one 16th step is 0.125 s.
+        let mut song = Song {
+            bpm: 120.0,
+            ..Song::default()
+        };
+        let i = song.add_sample(Sample {
+            name: "tone".into(),
+            clip: Clip {
+                rate: RATE,
+                data: tone(200.0, 1.0),
+            },
+        });
+        assert!(song.use_sample(0, i));
+        // The 1 s file cut in 8: each slice is one step long. Play slice 0 on step 8.
+        let chop = &mut song.scenes[0].chop;
+        chop.clear();
+        chop.set(0, 8, true);
+        let out = render(&song, RATE, Export::Scene { scene: 0, loops: 1 });
+        let step = (song.step_seconds() * RATE as f32) as usize;
+        assert!(loudest(&out, 0, step * 8) < 1e-4, "chop played early");
+        assert!(
+            loudest(&out, step * 8, step * 9) > 0.1,
+            "chop missing from export"
+        );
+        assert!(
+            loudest(&out, step * 10, step * 16) < 1e-4,
+            "slice ran too long"
+        );
+    }
+
+    #[test]
+    fn export_stretches_takes_to_the_new_speed() {
+        // Recorded as one bar at 120 bpm (2 s). Exported at 90 bpm, a bar is 2.67 s.
+        let mut song = Song {
+            bpm: 90.0,
+            ..Song::default()
+        };
+        song.scenes[0].takes[0] = Some(Take {
+            clip: Clip {
+                rate: RATE,
+                data: tone(220.0, 2.0),
+            },
+            bars: 1,
+            bpm: 120.0,
+        });
+        let out = render(&song, RATE, Export::Scene { scene: 0, loops: 1 });
+        let loop_frames = (song.scene_seconds(0) * RATE as f32) as usize;
+        let tenth = RATE as usize / 10;
+        assert!(
+            loudest(&out, loop_frames - tenth, loop_frames) > 0.1,
+            "take ran out before the loop did"
+        );
+        let left: Vec<f32> = out[..loop_frames * 2].iter().step_by(2).copied().collect();
+        let crossings = left
+            .windows(2)
+            .filter(|w| w[0] < 0.0 && w[1] >= 0.0)
+            .count();
+        let hz = crossings as f32 / song.scene_seconds(0);
+        assert!((hz - 220.0).abs() < 5.0, "take changed pitch: {hz} Hz");
+    }
+
+    #[test]
+    fn exported_wav_is_cd_quality_stereo() {
+        let path = temp_wav("format.wav");
+        let song = Song::starter();
+        export_wav(&song, Export::Scene { scene: 0, loops: 1 }, &path).unwrap();
+        let reader = hound::WavReader::open(&path).unwrap();
+        let spec = reader.spec();
+        assert_eq!(
+            (spec.channels, spec.sample_rate, spec.bits_per_sample),
+            (2, 44_100, 16)
+        );
+        let frames = reader.duration() as f32;
+        let expected = (song.scene_seconds(0) + TAIL_SECONDS) * 44_100.0;
+        assert!((frames - expected).abs() < 2.0, "{frames} vs {expected}");
+        std::fs::remove_file(&path).unwrap();
     }
 
     #[test]

@@ -27,6 +27,10 @@ pub const SLICE_CHOICES: [usize; 3] = [4, 8, 16];
 pub const MAX_SLICES: usize = 16;
 /// Most sound files one song can hold for chopping.
 pub const MAX_SAMPLES: usize = 32;
+// Every scene can use a different file and there's still room for another.
+const _: () = assert!(SCENES < MAX_SAMPLES);
+/// Shortest part of a file you can chop.
+pub const MIN_PART_SECONDS: f32 = 0.05;
 pub const SCENES: usize = 8;
 pub const SCENE_NAMES: [&str; SCENES] = ["A", "B", "C", "D", "E", "F", "G", "H"];
 /// Longest song row we allow, so a runaway click can't make an hour of music.
@@ -316,6 +320,12 @@ pub struct Clip {
     pub data: Arc<Vec<f32>>,
 }
 
+impl Clip {
+    pub fn seconds(&self) -> f32 {
+        self.data.len() as f32 / self.rate.max(1) as f32
+    }
+}
+
 impl PartialEq for Clip {
     fn eq(&self, other: &Self) -> bool {
         self.rate == other.rate && Arc::ptr_eq(&self.data, &other.data)
@@ -490,6 +500,18 @@ impl Default for Chop {
 }
 
 impl Chop {
+    /// Dragging across the waveform from `anchor` to `now` seconds picks that part.
+    pub fn drag_region(&mut self, anchor: f32, now: f32) {
+        self.start = anchor.min(now).max(0.0);
+        self.length = (anchor - now).abs().max(MIN_PART_SECONDS);
+    }
+
+    /// Clicking the waveform moves the part to start there, keeping all of
+    /// it inside the file when it fits.
+    pub fn move_region(&mut self, to: f32, file_secs: f32) {
+        self.start = to.min(file_secs - self.length).max(0.0);
+    }
+
     /// Where slice `i` starts and ends, in samples of `clip`.
     pub fn slice_range(&self, i: usize, clip: &Clip) -> (usize, usize) {
         let rate = clip.rate as f32;
@@ -1019,6 +1041,48 @@ impl Song {
         self.arrangement.truncate(MAX_ARRANGEMENT);
     }
 
+    /// Keep a sound file for chopping and say where it went. When the song is
+    /// full, files no scene uses make room (there are always some).
+    pub fn add_sample(&mut self, sample: Sample) -> usize {
+        if self.samples.len() >= MAX_SAMPLES {
+            self.prune_samples();
+        }
+        self.samples.push(sample);
+        self.samples.len() - 1
+    }
+
+    /// Chop sound file `i` in `scene`, starting with up to one loop's worth
+    /// from the top. An empty grid gets every slice in order, so it plays
+    /// right away. False if nothing changed.
+    pub fn use_sample(&mut self, scene: usize, i: usize) -> bool {
+        let loop_secs = self.scene_seconds(scene);
+        let Some(sample) = self.samples.get(i) else {
+            return false;
+        };
+        let scene = &mut self.scenes[scene];
+        if scene.chop.sample == Some(i) {
+            return false;
+        }
+        let steps = scene.steps();
+        let chop = &mut scene.chop;
+        chop.sample = Some(i);
+        chop.start = 0.0;
+        chop.length = sample.clip.seconds().min(loop_secs);
+        if !chop.has_hits(steps) {
+            chop.in_order(steps);
+        }
+        true
+    }
+
+    /// How long the file `scene` is chopping is, in seconds (0 if none).
+    pub fn chop_file_seconds(&self, scene: usize) -> f32 {
+        self.scenes[scene]
+            .chop
+            .sample
+            .and_then(|i| self.samples.get(i))
+            .map_or(0.0, |s| s.clip.seconds())
+    }
+
     /// Drop sound files no scene uses any more, so saved songs stay small.
     pub fn prune_samples(&mut self) {
         let used: Vec<bool> = (0..self.samples.len())
@@ -1327,6 +1391,93 @@ mod tests {
             [0, 1, 2, 3]
         );
         assert_eq!(chop.hit_at(4), Some(1));
+    }
+
+    fn sample(name: &str, seconds: f32) -> Sample {
+        Sample {
+            name: name.into(),
+            clip: Clip {
+                rate: 1_000,
+                data: Arc::new(vec![0.1; (seconds * 1_000.0) as usize]),
+            },
+        }
+    }
+
+    #[test]
+    fn using_a_sample_chops_one_loop_of_it_in_order() {
+        // One bar at 120 bpm is 2 s.
+        let mut song = Song {
+            bpm: 120.0,
+            ..Song::default()
+        };
+        let long = song.add_sample(sample("long", 5.0));
+        assert!(song.use_sample(0, long));
+        let chop = &song.scenes[0].chop;
+        assert_eq!(chop.sample, Some(long));
+        assert_eq!((chop.start, chop.length), (0.0, 2.0));
+        let order: Vec<_> = (0..16).filter_map(|s| chop.hit_at(s)).collect();
+        assert_eq!(order, (0..8).collect::<Vec<_>>());
+        assert_eq!(song.chop_file_seconds(0), 5.0);
+        assert_eq!(song.chop_file_seconds(1), 0.0);
+
+        // Picking the same file again leaves the part alone.
+        song.scenes[0].chop.start = 1.5;
+        assert!(!song.use_sample(0, long));
+        assert_eq!(song.scenes[0].chop.start, 1.5);
+
+        // A different file starts from its top, but keeps the pattern you made.
+        song.scenes[0].chop.clear();
+        song.scenes[0].chop.set(3, 5, true);
+        let short = song.add_sample(sample("short", 0.5));
+        assert!(song.use_sample(0, short));
+        let chop = &song.scenes[0].chop;
+        assert_eq!((chop.start, chop.length), (0.0, 0.5));
+        assert_eq!((0..16).filter_map(|s| chop.hit_at(s)).count(), 1);
+        assert_eq!(chop.hit_at(5), Some(3));
+
+        // No such file: nothing happens.
+        assert!(!song.use_sample(1, 99));
+        assert_eq!(song.scenes[1].chop.sample, None);
+    }
+
+    #[test]
+    fn a_full_song_makes_room_for_another_sample() {
+        let mut song = Song::default();
+        for i in 0..MAX_SAMPLES {
+            song.add_sample(sample(&format!("s{i}"), 0.1));
+        }
+        song.use_sample(0, 5);
+        song.use_sample(1, 31);
+        let new = song.add_sample(sample("new", 0.1));
+        let names: Vec<_> = song.samples.iter().map(|s| s.name.as_str()).collect();
+        assert_eq!(names, ["s5", "s31", "new"]);
+        assert_eq!(new, 2);
+        let chopping = |s: usize| &song.samples[song.scenes[s].chop.sample.unwrap()].name;
+        assert_eq!((chopping(0).as_str(), chopping(1).as_str()), ("s5", "s31"));
+    }
+
+    #[test]
+    fn dragging_and_clicking_the_waveform_picks_the_part() {
+        let mut chop = Chop::default();
+        chop.drag_region(1.0, 3.0);
+        assert_eq!((chop.start, chop.length), (1.0, 2.0));
+        // Dragging right to left picks the same part.
+        chop.drag_region(3.0, 1.0);
+        assert_eq!((chop.start, chop.length), (1.0, 2.0));
+        // A tiny drag still leaves something to chop.
+        chop.drag_region(2.0, 2.0);
+        assert_eq!((chop.start, chop.length), (2.0, MIN_PART_SECONDS));
+
+        chop.length = 2.0;
+        chop.move_region(1.25, 5.0);
+        assert_eq!(chop.start, 1.25);
+        // Near the end, the part stops at the end of the file.
+        chop.move_region(4.5, 5.0);
+        assert_eq!(chop.start, 3.0);
+        // A part longer than the file starts at the top.
+        chop.length = 9.0;
+        chop.move_region(2.0, 5.0);
+        assert_eq!(chop.start, 0.0);
     }
 
     #[test]
