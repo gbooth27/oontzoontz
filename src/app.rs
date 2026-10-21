@@ -148,9 +148,10 @@ pub struct OontzApp {
 }
 
 impl OontzApp {
-    pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
+    /// Starts on the song at `path` if there is one, or the starter beat.
+    pub fn new(cc: &eframe::CreationContext<'_>, path: Option<PathBuf>) -> Self {
         style(&cc.egui_ctx);
-        let song = Song::starter();
+        let (song, path, status) = startup_song(path);
         let (audio, audio_error) = match Audio::start(&song) {
             Ok(audio) => (Some(audio), None),
             Err(e) => (None, Some(e)),
@@ -166,9 +167,8 @@ impl OontzApp {
             synth_tab: 0,
             drag: None,
             rng: Rng::from_time(),
-            status: "👋 Press PLAY (or the space bar). Click the squares to change the beat."
-                .into(),
-            path: None,
+            status,
+            path,
             out_meter: 0.0,
             mic_meter: 0.0,
             recording: None,
@@ -2275,6 +2275,32 @@ fn cell_rect(rect: Rect, step: usize, row: usize, cw: f32, rh: f32) -> Rect {
 }
 
 /// Beats alternate shades so you can count along; the playhead column glows.
+/// What to show first: the song file named on the command line, or the starter beat.
+fn startup_song(path: Option<PathBuf>) -> (Song, Option<PathBuf>, String) {
+    const WELCOME: &str = "👋 Press PLAY (or the space bar). Click the squares to change the beat.";
+    let Some(path) = path else {
+        return (Song::starter(), None, WELCOME.into());
+    };
+    match Song::load(&path) {
+        Ok(song) => {
+            let status = if song.arrangement.is_empty() {
+                format!("📂 Opened {}. Press ▶ PLAY.", file_name(&path))
+            } else {
+                format!(
+                    "📂 Opened {}. Press ▶ SONG to hear it all.",
+                    file_name(&path)
+                )
+            };
+            (song, Some(path), status)
+        }
+        Err(e) => (
+            Song::starter(),
+            None,
+            format!("😕 Couldn't open {}: {e}", file_name(&path)),
+        ),
+    }
+}
+
 fn empty_cell(step: usize, playhead: Option<usize>) -> Color32 {
     if playhead == Some(step) {
         CELL_NOW
@@ -2326,4 +2352,37 @@ fn dim(c: Color32) -> Color32 {
 fn file_name(path: &Path) -> String {
     path.file_name()
         .map_or_else(String::new, |n| n.to_string_lossy().into_owned())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn starts_on_the_song_named_on_the_command_line() {
+        let (song, path, _) = startup_song(None);
+        assert!(path.is_none());
+        assert_eq!(song.arrangement, Song::starter().arrangement);
+
+        let dir = std::env::temp_dir().join(format!("oontz-app-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("mine.oontz");
+        let mut mine = Song::starter();
+        mine.bpm = 133.0;
+        mine.arrangement = vec![0, 0];
+        mine.save(&file).unwrap();
+        let (song, path, status) = startup_song(Some(file.clone()));
+        assert_eq!((song.bpm, path), (133.0, Some(file.clone())));
+        assert!(
+            status.contains("mine.oontz") && status.contains("SONG"),
+            "{status}"
+        );
+
+        std::fs::write(&file, "not a song").unwrap();
+        let (song, path, status) = startup_song(Some(file.clone()));
+        assert!(path.is_none());
+        assert_eq!(song.bpm, Song::starter().bpm);
+        assert!(status.starts_with("😕"), "{status}");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
 }

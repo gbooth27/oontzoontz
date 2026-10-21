@@ -10,9 +10,13 @@ mod history;
 mod song;
 mod synth;
 
+use std::path::PathBuf;
+
 use eframe::egui;
 
+/// `oontzoontz [song.oontz]`: opens the song if you name one.
 fn main() -> eframe::Result {
+    let path = std::env::args_os().nth(1).map(PathBuf::from);
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title("OontzOontz")
@@ -23,6 +27,6 @@ fn main() -> eframe::Result {
     eframe::run_native(
         "OontzOontz",
         options,
-        Box::new(|cc| Ok(Box::new(app::OontzApp::new(cc)))),
+        Box::new(|cc| Ok(Box::new(app::OontzApp::new(cc, path)))),
     )
 }

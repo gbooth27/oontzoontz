@@ -11,6 +11,14 @@ You need Rust 1.99 or newer.
 cargo run --release
 ```
 
+Name a song file to open it straight away. `songs/dance-punk.oontz` is a
+demo: eight scenes of dance-punk (cowbell, pulsing acid bass, one buzzy riff
+whose filter opens up as the song goes on). Press **▶ SONG** to hear it all.
+
+```sh
+cargo run --release -- songs/dance-punk.oontz
+```
+
 ## How to use
 
 1. Press **▶ PLAY** (or the space bar). A beat is already there.
